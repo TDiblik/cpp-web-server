@@ -25,7 +25,7 @@ Initial optimizations are significant enough that we don't need to measure it us
 Final version of the code can be found at master, all of the other versions are refered to by their appropriate git tag.
 
 ## Naive version
-I tried to write a version with as many beginner mistakes as possible. It can be found at commit <insert_after_commiting>.
+I tried to write a version with as many beginner mistakes as possible. It can be found at commit 072df00e03af5c9978e642f355cda08153a987a0.
 
 Results:
 ```sh
