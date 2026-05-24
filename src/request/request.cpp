@@ -1,173 +1,141 @@
 #include "request.hpp"
 #include "enums.hpp"
 
+#include <charconv>
+#include <cstddef>
 #include <unistd.h>
 #include <string>
 #include <sys/socket.h>
 
-
-Request::Request(int client_fd) : _client_fd(client_fd) {}
+Request::Request(int client_fd) : _client_fd(client_fd) {
+  this->_request_raw.reserve(HEADERS_USUAL_SIZE);
+}
 
 Request::~Request() {
   if (this->_client_fd != -1) [[likely]] ::close(this->_client_fd);
 }
 
 RequestParseError Request::parse() {
-  // ---------------------------------------------------------
-  // 1. Read the Request Line 1 byte at a time
-  // ---------------------------------------------------------
-  char req_line[512] = {0};
-  size_t req_line_len = 0;
-  bool req_line_ok = false;
+  // read req line + headers
+  size_t headers_end = std::string::npos;
+  {
+    size_t search_start = 0;
+    ssize_t bytes_read = 0;
+    char buffer[HEADERS_USUAL_SIZE];
+    while (true) {
+      bytes_read = ::read(this->_client_fd, buffer, sizeof(buffer));
+      if (bytes_read <= 0) [[unlikely]] return RequestParseError_SocketError;
 
-  while (req_line_len < sizeof(req_line) - 1) {
-    char c;
-    if (::read(this->_client_fd, &c, 1) <= 0) return RequestParseError_SocketError;
+      size_t bytes_read_t = static_cast<std::size_t>(bytes_read);
+      if ((this->_request_raw.size() + bytes_read_t) >= HEADERS_MAX_SIZE) [[unlikely]] return RequestParseError_PayloadTooLarge;
+      this->_request_raw.append(buffer, bytes_read_t);
 
-    req_line[req_line_len++] = c;
-    this->_request_raw.push_back(c); // Append to backing store for string_views later
+      headers_end = this->_request_raw.find("\r\n\r\n", (search_start >= 3) ? search_start - 3 : 0); // -3 to catch split \r\n\r\n
+      if (headers_end != std::string::npos) [[likely]] break; // likely since most requests are gonna fit into the HEADERS_USUAL_SIZE right away
 
-    if (req_line_len >= 2 && req_line[req_line_len - 2] == '\r' && req_line[req_line_len - 1] == '\n') {
-      req_line[req_line_len] = '\0';
-      req_line_ok = true;
-      break;
+      search_start = this->_request_raw.size();
     }
   }
-  if (!req_line_ok) return RequestParseError_MalformedRequest;
 
-  // ---------------------------------------------------------
-  // 2. Parse Request Line with sscanf
-  // ---------------------------------------------------------
-  char method_buf[16] = {0};
-  char path_buf[256] = {0};
-  char protocol_buf[16] = {0};
+  // parse request line (example: `GET /some/path HTTP/1.1`)
+  size_t req_line_end = this->_request_raw.find("\r\n");
+  if (req_line_end == std::string::npos) [[unlikely]] return RequestParseError_MalformedRequest;
 
-  if (sscanf(req_line, "%15s %255s %15s", method_buf, path_buf, protocol_buf) != 3) return RequestParseError_MalformedRequest;
+  std::string_view req_line(this->_request_raw.data(), req_line_end);
+  size_t first_space = req_line.find(' ');
+  size_t second_space = req_line.find(' ', first_space + 1);
+  if (first_space == std::string::npos || second_space == std::string::npos) [[unlikely]] return RequestParseError_MalformedRequest;
 
-  if (strcmp(method_buf, "GET") == 0) this->method = HTTP_GET;
-  else if (strcmp(method_buf, "HEAD") == 0) this->method = HTTP_HEAD;
-  else if (strcmp(method_buf, "POST") == 0) this->method = HTTP_POST;
-  else if (strcmp(method_buf, "PUT") == 0) this->method = HTTP_PUT;
-  else if (strcmp(method_buf, "DELETE") == 0) this->method = HTTP_DELETE;
-  else if (strcmp(method_buf, "CONNECT") == 0) this->method = HTTP_CONNECT;
-  else if (strcmp(method_buf, "OPTIONS") == 0) this->method = HTTP_OPTIONS;
-  else if (strcmp(method_buf, "TRACE") == 0) this->method = HTTP_TRACE;
-  else if (strcmp(method_buf, "PATCH") == 0) this->method = HTTP_PATCH;
-  else return RequestParseError_MalformedRequest;
+  std::string_view method_str = req_line.substr(0, first_space);
+  if (method_str == "GET") this->method = HTTP_GET;
+  else if (method_str == "POST") this->method = HTTP_POST;
+  else if (method_str == "HEAD") this->method = HTTP_HEAD;
+  else if (method_str == "PUT") this->method = HTTP_PUT;
+  else if (method_str == "DELETE") this->method = HTTP_DELETE;
+  else if (method_str == "CONNECT") this->method = HTTP_CONNECT;
+  else if (method_str == "OPTIONS") this->method = HTTP_OPTIONS;
+  else if (method_str == "TRACE") this->method = HTTP_TRACE;
+  else if (method_str == "PATCH") this->method = HTTP_PATCH;
+  else [[unlikely]] return RequestParseError_MalformedRequest;
 
-  if (strcmp(protocol_buf, "HTTP/1.1") != 0 && strcmp(protocol_buf, "HTTP/1.0") != 0) return RequestParseError_MalformedRequest;
+  this->path = req_line.substr(first_space + 1, second_space - first_space - 1);
 
-  size_t method_pos = this->_request_raw.find(method_buf);
-  size_t path_pos = this->_request_raw.find(path_buf, method_pos + strlen(method_buf));
-  size_t protocol_pos = this->_request_raw.find(protocol_buf, path_pos + strlen(path_buf));
+  this->protocol = req_line.substr(second_space + 1);
+  if (this->protocol != "HTTP/1.1" && this->protocol != "HTTP/1.0") [[unlikely]] return RequestParseError_HttpVersionNotSupported;
 
-  this->path = std::string_view(this->_request_raw.data() + path_pos, strlen(path_buf));
-  this->protocol = std::string_view(this->_request_raw.data() + protocol_pos, strlen(protocol_buf));
+  // parse headers
+  size_t pos = req_line_end + 2; // skip the \r\n
+  if (pos > headers_end) [[unlikely]] return RequestParseError_MalformedRequest;
+  while (pos < headers_end) {
+    // parse header line (example: `Connection: keep-alive`)
+    size_t eol = this->_request_raw.find("\r\n", pos);
+    if (eol == std::string::npos) [[unlikely]] return RequestParseError_MalformedRequest;
 
-  // ---------------------------------------------------------
-  // 3. Read Headers 1 byte at a time
-  // ---------------------------------------------------------
-  bool headers_ok = false;
-  size_t headers_start_idx = this->_request_raw.size();
-  size_t current_headers_len = 0;
+    std::string_view line(_request_raw.data() + pos, eol - pos);
 
-  while (current_headers_len < HEADERS_MAX_SIZE) {
-    char c;
-    if (::read(this->_client_fd, &c, 1) <= 0) return RequestParseError_SocketError;
+    size_t colon = line.find(":");
+    if (colon == std::string::npos) [[unlikely]] return RequestParseError_MalformedRequest;
 
-    this->_request_raw.push_back(c);
-    current_headers_len++;
+    std::string_view name = line.substr(0, colon);
 
-    size_t total_len = this->_request_raw.size();
-    if (total_len >= 4 &&
-        this->_request_raw[total_len - 4] == '\r' &&
-        this->_request_raw[total_len - 3] == '\n' &&
-        this->_request_raw[total_len - 2] == '\r' &&
-        this->_request_raw[total_len - 1] == '\n') {
-      headers_ok = true;
-      break;
+    size_t val_start = line.find_first_not_of(" \t", colon + 1);
+    std::string_view value = (val_start == std::string::npos) ? std::string_view{} : line.substr(val_start);
+
+    headers[name] = value;
+    pos = eol + 2;
+  }
+
+  // parse body
+  size_t content_length = 0;
+  {
+    auto it = this->headers.find("Content-Length");
+    if (it == this->headers.end()) return RequestParseError_Ok;
+
+    auto [_, err] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), content_length);
+    if (err != std::errc()) [[unlikely]] return RequestParseError_MalformedRequest;
+  }
+  if (content_length == 0) [[unlikely]] return RequestParseError_Ok;
+  if (content_length > BODY_MAX_SIZE) [[unlikely]] return RequestParseError_PayloadTooLarge;
+
+  // since we're reading HEADERS_USUAL_SIZE while reading headers, it's possible we've already read all of the body bytes
+  // if not, calculate how many are left to read
+  size_t body_start = headers_end + 4; // Skip past the \r\n\r\n
+  size_t body_already_read = this->_request_raw.size() - body_start;
+  if (body_already_read < content_length) {
+    size_t bytes_remaining = content_length - body_already_read;
+    size_t current_size = this->_request_raw.size();
+    size_t new_size = current_size + bytes_remaining;
+    this->_request_raw.resize_and_overwrite(new_size, [new_size](char*, size_t) { return new_size; }); // resize without zero-filling
+
+    char* write_ptr = this->_request_raw.data() + current_size;
+    while (bytes_remaining > 0) {
+      ssize_t bytes_read = ::read(this->_client_fd, write_ptr, bytes_remaining);
+      if (bytes_read <= 0) [[unlikely]] return RequestParseError_SocketError;
+
+      write_ptr += bytes_read;
+      bytes_remaining -= static_cast<std::size_t>(bytes_read);
     }
   }
-  if (!headers_ok) return RequestParseError_PayloadTooLarge;
-
-  // ---------------------------------------------------------
-  // 4. Parse Headers with C-style pointer math
-  // ---------------------------------------------------------
-  char* header_start = this->_request_raw.data() + headers_start_idx;
-
-  while (true) {
-    char* end_of_line = strstr(header_start, "\r\n");
-    if (!end_of_line || end_of_line == header_start) break;
-
-    char* colon = strchr(header_start, ':');
-    if (!colon || colon > end_of_line) return RequestParseError_MalformedRequest;
-
-    size_t name_len = (unsigned long)(colon - header_start);
-    std::string_view name(header_start, name_len);
-
-    char* value_start = colon + 1;
-    while (*value_start == ' ' && value_start < end_of_line) value_start++;
-
-    size_t value_len = (unsigned long)(end_of_line - value_start);
-    std::string_view value(value_start, value_len);
-
-    this->headers[name] = value;
-    header_start = end_of_line + 2;
-  }
-
-  // ---------------------------------------------------------
-  // 5. Read Body with atoi and malloc
-  // ---------------------------------------------------------
-  auto it = this->headers.find("Content-Length");
-  if (it == this->headers.end()) return RequestParseError_Ok;
-
-  std::string content_len_str = std::string(it->second);
-  int parsed_len = atoi(content_len_str.c_str());
-
-  if (parsed_len < 0) return RequestParseError_MalformedRequest;
-  if (parsed_len == 0) return RequestParseError_Ok;
-
-  size_t content_len = static_cast<size_t>(parsed_len);
-  if (content_len > BODY_MAX_SIZE) return RequestParseError_PayloadTooLarge;
-
-  char* temp_body_buf = (char*)malloc(content_len + 1);
-  if (!temp_body_buf) return RequestParseError_SocketError;
-
-  size_t body_bytes_read = 0;
-  while (body_bytes_read < content_len) {
-    ssize_t bytes_read = ::read(this->_client_fd, temp_body_buf + body_bytes_read, content_len - body_bytes_read);
-    if (bytes_read <= 0) {
-      free(temp_body_buf);
-      return RequestParseError_SocketError;
-    }
-    body_bytes_read += static_cast<size_t>(bytes_read);
-  }
-  temp_body_buf[body_bytes_read] = '\0';
-
-  size_t body_start_idx = this->_request_raw.size();
-  this->_request_raw.append(temp_body_buf, body_bytes_read);
-  free(temp_body_buf);
-
-  this->body = std::string_view(this->_request_raw.data() + body_start_idx, body_bytes_read);
+  this->body = std::string_view(this->_request_raw.data() + body_start, content_length);
 
   return RequestParseError_Ok;
 }
 
 void Request::_client_fd_send(std::string_view message, int flags) {
+  ssize_t sent = 0;
+  size_t total_sent = 0;
+  auto message_len = message.length();
   flags |= MSG_NOSIGNAL;
 
-  // ---------------------------------------------------------
-  // Send exactly 1 byte per system call
-  // ---------------------------------------------------------
-  for (size_t i = 0; i < message.length(); i++) {
-    char c = message[i];
-    ssize_t sent = ::send(this->_client_fd, &c, 1, flags);
-    if (sent <= 0) return;
+  while (total_sent < message_len) {
+    sent = ::send(_client_fd, message.data() + total_sent, message_len - total_sent, flags);
+    if (sent <= 0) [[unlikely]] return;
+    total_sent += static_cast<size_t>(sent);
   }
 }
 
 void Request::send_response(ResponseCode code, std::string_view content_type, std::string_view resp_body) {
-  std::string status_line;
+  std::string_view status_line;
   switch (code) {
     case ResponseCode_OK: status_line = "200 OK"; break;
     case ResponseCode_BadRequest: status_line = "400 Bad Request"; break;
@@ -176,21 +144,20 @@ void Request::send_response(ResponseCode code, std::string_view content_type, st
     default: status_line = "500 Internal Server Error"; break;
   }
 
-  std::string response = "";
-  response += "HTTP/1.1 ";
-  response += status_line;
-  response += "\r\n";
+  char header_buf[256];
+  int header_len = std::snprintf(
+    header_buf, sizeof(header_buf),
+    "HTTP/1.1 %.*s\r\n"
+    "Content-Type: %.*s\r\n"
+    "Content-Length: %zu\r\n"
+    "Connection: close\r\n\r\n",
+    static_cast<int>(status_line.size()), status_line.data(),
+    static_cast<int>(content_type.size()), content_type.data(),
+    resp_body.size()
+  );
 
-  response += "Content-Type: ";
-  response += std::string(content_type);
-  response += "\r\n";
+  if (header_len < 0 || static_cast<size_t>(header_len) >= sizeof(header_buf)) return;
 
-  response += "Content-Length: ";
-  response += std::to_string(resp_body.size());
-  response += "\r\n";
-
-  response += "Connection: close\r\n\r\n";
-
-  if (!resp_body.empty()) response += std::string(resp_body);
-  this->_client_fd_send(response, 0);
+  this->_client_fd_send(std::string_view(header_buf, static_cast<size_t>(header_len)), 0);
+  if (!resp_body.empty()) this->_client_fd_send(resp_body, 0);
 }

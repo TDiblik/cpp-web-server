@@ -7,6 +7,7 @@
 
 class Request {
   private:
+    inline static constexpr uint32_t HEADERS_USUAL_SIZE = 4096; // 99% of headers will be this length
     inline static constexpr uint32_t HEADERS_MAX_SIZE = 65536; // 64KB
     inline static constexpr uint32_t BODY_MAX_SIZE = 10485760; // 10MB
 
