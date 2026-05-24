@@ -75,7 +75,7 @@ Transfer/sec:      4.08KB
 
 ## Optimize parsing
 
-The main goal of these optimizations was to reduce syscalls as much as possible + add some allocation optimizations here and there. It can be found at commit `fb042f04c656a0c0ddf77b9a04b2aa1df24593ef`. To see all of the optimizations, run `git diff 072df00e03af5c9978e642f355cda08153a987a0 fb042f04c656a0c0ddf77b9a04b2aa1df24593ef`.
+The main goal of these optimizations was to reduce syscalls as much as possible + add some allocation optimizations here and there. It can be found at commit `fb042f04c656a0c0ddf77b9a04b2aa1df24593ef`.
 
 ### `Request.cpp`
 
@@ -240,4 +240,166 @@ Running 10s test @ http://localhost:8888/
   Non-2xx or 3xx responses: 5099
 Requests/sec:    517.00
 Transfer/sec:      1.62KB
+```
+
+## Other flow micro-optimizations
+
+The next set of optimizations focused on memory layout, data structures, and further syscall reduction. It can be found at commit `0df647a50f601d8bb49bea62152b827ac0a756bd`.
+
+### `enums.hpp & request.hpp`
+
+- Aligning the Struct Layout
+```cpp
+enum HttpMethod : uint8_t {
+  HTTP_GET,
+  HTTP_HEAD,
+  HTTP_POST,
+  HTTP_PUT,
+  HTTP_DELETE,
+  HTTP_CONNECT,
+  HTTP_OPTIONS,
+  HTTP_TRACE,
+  HTTP_PATCH,
+  HTTP_UNKNOWN = 255,
+};
+```
+By enforcing explicit sizes on enums (`enum HttpMethod : uint8_t`) and adding `HTTP_UNKNOWN = 255`, the parser gets a cheap default state for detecting unsupported HTTP methods.
+
+```cpp
+class Request {
+  // constants
+  private:
+    inline static constexpr uint32_t HEADERS_USUAL_SIZE = 4096; // 99% of headers will be this length
+    inline static constexpr uint32_t HEADERS_MAX_SIZE = 65536; // 64KB
+    inline static constexpr uint32_t USUAL_NUMBER_OF_HEADERS = 25;
+    inline static constexpr uint32_t BODY_MAX_SIZE = 10485760; // 10MB
+
+  // aligned members
+  private:
+    std::string _request_raw;
+    std::string_view _headers_raw;
+    int _client_fd;
+  public:
+    HttpMethod method;
+    std::vector<HeaderType> headers;
+    std::string_view path;
+    std::string_view protocol;
+    std::string_view body;
+  // ...
+};
+```
+By reordering the class members, we eliminate wasted padding. Placing the 4-byte `_client_fd` right next to the 1-byte `method` allows the compiler to pack them tightly into a single 8-byte boundary right before the 8-byte aligned `headers` vector begins. This shrinks the overall object size, reducing memory pressure and improving cache locality.
+
+- Data-Oriented Design (Vector vs. Hash Map)
+```cpp
+// Replaced this:
+std::unordered_map<std::string_view, std::string_view> headers;
+
+// With this:
+using HeaderNameType = std::string_view;
+using HeaderValueType = std::string_view;
+using HeaderType = std::pair<HeaderNameType, HeaderValueType>;
+
+std::vector<HeaderType> headers;
+
+// And in the constructor:
+Request::Request(int client_fd) : _client_fd(client_fd), method(HTTP_UNKNOWN) {
+  this->_request_raw.reserve(HEADERS_USUAL_SIZE);
+  this->headers.reserve(USUAL_NUMBER_OF_HEADERS);
+}
+```
+Swapping `std::unordered_map` for a `std::vector` of pairs is a performance win. For small collections (like 25 HTTP headers), the overhead of hashing a string, dealing with bucket collisions, and jumping around fragmented memory in a linked list is far slower than just doing a linear scan over a contiguous block of memory in a `std::vector`. Reserving the space in the constructor also eliminates allocations during parsing.
+
+### `request.cpp`
+
+- HTTP Method Switch Trick
+```cpp
+std::string_view method_str = req_line.substr(0, first_space);
+if (method_str.empty()) [[unlikely]] return RequestParseError_MalformedRequest;
+switch (method_str[0]) {
+  case 'G': if (method_str == "GET") this->method = HTTP_GET; break;
+  case 'P':
+    if (method_str == "POST") this->method = HTTP_POST;
+    else if (method_str == "PUT") this->method = HTTP_PUT;
+    else if (method_str == "PATCH") this->method = HTTP_PATCH;
+    break;
+  case 'H': if (method_str == "HEAD") this->method = HTTP_HEAD; break;
+  case 'D': if (method_str == "DELETE") this->method = HTTP_DELETE; break;
+  case 'C': if (method_str == "CONNECT") this->method = HTTP_CONNECT; break;
+  case 'O': if (method_str == "OPTIONS") this->method = HTTP_OPTIONS; break;
+  case 'T': if (method_str == "TRACE") this->method = HTTP_TRACE; break;
+}
+if (this->method == HTTP_UNKNOWN) [[unlikely]] return RequestParseError_MalformedRequest;
+```
+Replacing the massive if-else if string-comparison chain with a switch on the first character (`method_str[0]`) compiles into an optimized jump table. Since HTTP methods have conveniently unique starting letters, we instantly skip almost all the string comparisons.
+
+- Gather I/O (`writev`)
+```cpp
+iovec iov[2];
+iov[0].iov_base = header_buf;
+iov[0].iov_len = static_cast<size_t>(header_len);
+int iovcnt = 1;
+
+if (!resp_body.empty()) {
+  iov[1].iov_base = const_cast<char*>(resp_body.data());
+  iov[1].iov_len = resp_body.size();
+  iovcnt = 2;
+}
+
+int iov_index = 0;
+while (iov_index < iovcnt) {
+  ssize_t written = ::writev(this->_client_fd, &iov[iov_index], iovcnt - iov_index);
+  if (written <= 0) [[unlikely]] return;
+
+  size_t bytes_to_advance = static_cast<size_t>(written);
+
+  while (iov_index < iovcnt && bytes_to_advance > 0) {
+    if (bytes_to_advance >= iov[iov_index].iov_len) {
+      bytes_to_advance -= iov[iov_index].iov_len;
+      iov_index++;
+    } else {
+      iov[iov_index].iov_base = static_cast<char*>(iov[iov_index].iov_base) + bytes_to_advance;
+      iov[iov_index].iov_len -= bytes_to_advance;
+      bytes_to_advance = 0;
+    }
+  }
+}
+```
+Replacing multiple `send()` calls with a single `writev()` using `iovec` avoids copying the header buffer and the body buffer into one giant string, and it drops system call overhead in half by sending both blocks of memory in a single kernel transition.
+
+### Results:
+```sh
+[cpp-web-server] (master) > wrk -t2 -c400 -d10s http://localhost:8888/
+Running 10s test @ http://localhost:8888/
+  2 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    12.54ms    3.86ms  62.90ms   93.58%
+    Req/Sec     4.30k   560.50     4.93k    86.87%
+  85574 requests in 10.06s, 8.65MB read
+  Socket errors: connect 151, read 0, write 0, timeout 0
+Requests/sec:   8504.73
+Transfer/sec:      0.86MB
+
+[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-get.lua http://localhost:8888/
+Running 10s test @ http://localhost:8888/
+  2 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    15.80ms    2.00ms  35.43ms   96.65%
+    Req/Sec     3.36k   201.54     3.76k    79.50%
+  66978 requests in 10.03s, 6.77MB read
+  Socket errors: connect 151, read 0, write 0, timeout 0
+Requests/sec:   6675.49
+Transfer/sec:    691.02KB
+
+[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-post.lua http://localhost:8888/
+Running 10s test @ http://localhost:8888/
+  2 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   141.95ms   41.95ms 200.42ms   79.84%
+    Req/Sec   263.54    155.84   666.00     67.24%
+  3998 requests in 10.09s, 10.98KB read
+  Socket errors: connect 151, read 3890, write 1334, timeout 0
+  Non-2xx or 3xx responses: 3916
+Requests/sec:    396.19
+Transfer/sec:      1.09KB
 ```
