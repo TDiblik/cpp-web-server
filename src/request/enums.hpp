@@ -12,6 +12,7 @@ enum HttpMethod : uint8_t {
   HTTP_OPTIONS,
   HTTP_TRACE,
   HTTP_PATCH,
+  HTTP_UNKNOWN = 255,
 };
 
 enum RequestParseError : uint8_t {

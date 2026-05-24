@@ -6,9 +6,11 @@
 #include <unistd.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
-Request::Request(int client_fd) : _client_fd(client_fd) {
+Request::Request(int client_fd) : _client_fd(client_fd), method(HTTP_UNKNOWN) {
   this->_request_raw.reserve(HEADERS_USUAL_SIZE);
+  this->headers.reserve(USUAL_NUMBER_OF_HEADERS);
 }
 
 Request::~Request() {
@@ -47,16 +49,21 @@ RequestParseError Request::parse() {
   if (first_space == std::string::npos || second_space == std::string::npos) [[unlikely]] return RequestParseError_MalformedRequest;
 
   std::string_view method_str = req_line.substr(0, first_space);
-  if (method_str == "GET") this->method = HTTP_GET;
-  else if (method_str == "POST") this->method = HTTP_POST;
-  else if (method_str == "HEAD") this->method = HTTP_HEAD;
-  else if (method_str == "PUT") this->method = HTTP_PUT;
-  else if (method_str == "DELETE") this->method = HTTP_DELETE;
-  else if (method_str == "CONNECT") this->method = HTTP_CONNECT;
-  else if (method_str == "OPTIONS") this->method = HTTP_OPTIONS;
-  else if (method_str == "TRACE") this->method = HTTP_TRACE;
-  else if (method_str == "PATCH") this->method = HTTP_PATCH;
-  else [[unlikely]] return RequestParseError_MalformedRequest;
+  if (method_str.empty()) [[unlikely]] return RequestParseError_MalformedRequest;
+  switch (method_str[0]) {
+    case 'G': if (method_str == "GET") this->method = HTTP_GET; break;
+    case 'P':
+      if (method_str == "POST") this->method = HTTP_POST;
+      else if (method_str == "PUT") this->method = HTTP_PUT;
+      else if (method_str == "PATCH") this->method = HTTP_PATCH;
+      break;
+    case 'H': if (method_str == "HEAD") this->method = HTTP_HEAD; break;
+    case 'D': if (method_str == "DELETE") this->method = HTTP_DELETE; break;
+    case 'C': if (method_str == "CONNECT") this->method = HTTP_CONNECT; break;
+    case 'O': if (method_str == "OPTIONS") this->method = HTTP_OPTIONS; break;
+    case 'T': if (method_str == "TRACE") this->method = HTTP_TRACE; break;
+  }
+  if (this->method == HTTP_UNKNOWN) [[unlikely]] return RequestParseError_MalformedRequest;
 
   this->path = req_line.substr(first_space + 1, second_space - first_space - 1);
 
@@ -81,17 +88,18 @@ RequestParseError Request::parse() {
     size_t val_start = line.find_first_not_of(" \t", colon + 1);
     std::string_view value = (val_start == std::string::npos) ? std::string_view{} : line.substr(val_start);
 
-    headers[name] = value;
+    this->_append_header({name, value});
     pos = eol + 2;
   }
 
   // parse body
   size_t content_length = 0;
   {
-    auto it = this->headers.find("Content-Length");
-    if (it == this->headers.end()) return RequestParseError_Ok;
+    auto it = this->get_header_value("Content-Length");
+    if (!it.has_value()) return RequestParseError_Ok;
 
-    auto [_, err] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), content_length);
+    auto val = it.value();
+    auto [_, err] = std::from_chars(val.data(), val.data() + val.size(), content_length);
     if (err != std::errc()) [[unlikely]] return RequestParseError_MalformedRequest;
   }
   if (content_length == 0) [[unlikely]] return RequestParseError_Ok;
@@ -121,17 +129,18 @@ RequestParseError Request::parse() {
   return RequestParseError_Ok;
 }
 
-void Request::_client_fd_send(std::string_view message, int flags) {
-  ssize_t sent = 0;
-  size_t total_sent = 0;
-  auto message_len = message.length();
-  flags |= MSG_NOSIGNAL;
 
-  while (total_sent < message_len) {
-    sent = ::send(_client_fd, message.data() + total_sent, message_len - total_sent, flags);
-    if (sent <= 0) [[unlikely]] return;
-    total_sent += static_cast<size_t>(sent);
-  }
+std::optional<HeaderType> Request::_find_header_raw(HeaderNameType header_name) {
+  for (const auto& header : this->headers) if (header.first == header_name) return header;
+  return std::nullopt;
+}
+
+void Request::_append_header(HeaderType header) { this->headers.emplace_back(header); }
+
+std::optional<HeaderValueType> Request::get_header_value(HeaderNameType header_name) {
+  auto header_opt = this->_find_header_raw(header_name);
+  if (!header_opt.has_value()) return std::nullopt;
+  return header_opt->second;
 }
 
 void Request::send_response(ResponseCode code, std::string_view content_type, std::string_view resp_body) {
@@ -158,6 +167,33 @@ void Request::send_response(ResponseCode code, std::string_view content_type, st
 
   if (header_len < 0 || static_cast<size_t>(header_len) >= sizeof(header_buf)) return;
 
-  this->_client_fd_send(std::string_view(header_buf, static_cast<size_t>(header_len)), 0);
-  if (!resp_body.empty()) this->_client_fd_send(resp_body, 0);
+  iovec iov[2];
+  iov[0].iov_base = header_buf;
+  iov[0].iov_len = static_cast<size_t>(header_len);
+  int iovcnt = 1;
+
+  if (!resp_body.empty()) {
+    iov[1].iov_base = const_cast<char*>(resp_body.data());
+    iov[1].iov_len = resp_body.size();
+    iovcnt = 2;
+  }
+
+  int iov_index = 0;
+  while (iov_index < iovcnt) {
+    ssize_t written = ::writev(this->_client_fd, &iov[iov_index], iovcnt - iov_index);
+    if (written <= 0) [[unlikely]] return;
+
+    size_t bytes_to_advance = static_cast<size_t>(written);
+
+    while (iov_index < iovcnt && bytes_to_advance > 0) {
+      if (bytes_to_advance >= iov[iov_index].iov_len) {
+        bytes_to_advance -= iov[iov_index].iov_len;
+        iov_index++;
+      } else {
+        iov[iov_index].iov_base = static_cast<char*>(iov[iov_index].iov_base) + bytes_to_advance;
+        iov[iov_index].iov_len -= bytes_to_advance;
+        bytes_to_advance = 0;
+      }
+    }
+  }
 }
