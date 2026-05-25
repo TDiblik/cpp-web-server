@@ -19,6 +19,9 @@ Server::Server(uint16_t port, bool log_ip) : _socket_fd(-1), _port(port), _log_i
   int set_opt_result = setsockopt(this->_socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   if (set_opt_result == -1) throw std::system_error(errno, std::generic_category(), "setting SO_REUSEADDR options failed");
 
+  set_opt_result = ::setsockopt(this->_socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+  if (set_opt_result == -1) throw std::system_error(errno, std::generic_category(), "setting SO_REUSEPORT options failed");
+
   set_opt_result = ::setsockopt(this->_socket_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
   if (set_opt_result == -1) throw std::system_error(errno, std::generic_category(), "setting TCP_NODELAY failed");
 

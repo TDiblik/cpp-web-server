@@ -31,6 +31,10 @@ add_compile_options(
   $<$<CONFIG:Release>:-fstack-protector-strong>
 )
 
+set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads REQUIRED)
+
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 add_compile_definitions($<$<CONFIG:Debug>:_GLIBCXX_DEBUG>)
@@ -43,3 +47,5 @@ target_sources(server PRIVATE
   src/server/server.hpp src/server/server.cpp
   src/request/enums.hpp src/request/request.hpp src/request/request.cpp
 )
+
+target_link_libraries(server ${CMAKE_THREAD_LIBS_INIT})

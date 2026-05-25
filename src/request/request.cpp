@@ -22,19 +22,19 @@ RequestParseError Request::parse() {
   size_t headers_end = std::string::npos;
   {
     size_t search_start = 0;
-    ssize_t bytes_read = 0;
-    char buffer[HEADERS_USUAL_SIZE];
     while (true) {
-      bytes_read = ::read(this->_client_fd, buffer, sizeof(buffer));
-      if (bytes_read <= 0) [[unlikely]] return RequestParseError_SocketError;
+      size_t current_size = this->_request_raw.size();
+      ssize_t actual_bytes_read = 0;
 
-      size_t bytes_read_t = static_cast<std::size_t>(bytes_read);
-      if ((this->_request_raw.size() + bytes_read_t) >= HEADERS_MAX_SIZE) [[unlikely]] return RequestParseError_PayloadTooLarge;
-      this->_request_raw.append(buffer, bytes_read_t);
+      this->_request_raw.resize_and_overwrite(current_size + HEADERS_USUAL_SIZE, [&](char* buf, size_t) {
+        actual_bytes_read = ::read(this->_client_fd, buf + current_size, HEADERS_USUAL_SIZE);
+        if (actual_bytes_read <= 0) return current_size;
+        return current_size + static_cast<size_t>(actual_bytes_read);
+      });
+      if (actual_bytes_read <= 0) [[unlikely]] return RequestParseError_SocketError;
 
       headers_end = this->_request_raw.find("\r\n\r\n", (search_start >= 3) ? search_start - 3 : 0); // -3 to catch split \r\n\r\n
       if (headers_end != std::string::npos) [[likely]] break; // likely since most requests are gonna fit into the HEADERS_USUAL_SIZE right away
-
       search_start = this->_request_raw.size();
     }
   }
