@@ -403,3 +403,108 @@ Running 10s test @ http://localhost:8888/
 Requests/sec:    396.19
 Transfer/sec:      1.09KB
 ```
+
+
+## Multithreading
+The next optimization was to stop running the whole server on a single thread and let the kernel distribute incoming connections between multiple listener sockets. It can be found at commit `4f8e4dc2c5264e49f7e2b1cbbdd63b862db8c2ce`.
+
+### `CMakeLists.txt`
+
+- Link pthreads
+```cmake
+set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads REQUIRED)
+
+# ...
+
+target_link_libraries(server ${CMAKE_THREAD_LIBS_INIT})
+```
+Since we're now using `std::thread`, we need to link the executable with the system threading library.
+
+### `Server.cpp`
+
+- Allow multi-threaded kernel load balancing
+```cpp
+set_opt_result = ::setsockopt(this->_socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+if (set_opt_result == -1) throw std::system_error(errno, std::generic_category(), "setting SO_REUSEPORT options failed");
+```
+`SO_REUSEPORT` allows multiple server sockets to bind to the same port. This lets each worker thread have its own listening socket, and the kernel can distribute incoming connections between them.
+
+### `main.cpp`
+
+- Spawn one listener per hardware thread
+```cpp
+unsigned int num_threads = std::thread::hardware_concurrency();
+if (num_threads == 0) num_threads = 8;
+
+std::print("Starting server on {} hardware threads using SO_REUSEPORT...\n", num_threads);
+
+std::vector<std::thread> workers;
+workers.reserve(num_threads);
+for (unsigned int i = 0; i < num_threads; i++) workers.emplace_back(listener);
+for (auto& t : workers) t.join();
+```
+Instead of running one server loop on the main thread, we now create one worker per hardware thread. Each worker runs its own `listener()` function, which creates its own `Server` instance and accepts connections independently.
+
+- Ignore `SIGPIPE`
+```cpp
+std::signal(SIGPIPE, SIG_IGN);
+```
+When clients disconnect early, writing to the socket can trigger `SIGPIPE`. Since this is a normal thing under load testing, we ignore it and let the write path fail normally instead of killing the whole process.
+
+### `request.cpp`
+
+- Read headers directly into the request string
+```cpp
+size_t current_size = this->_request_raw.size();
+ssize_t actual_bytes_read = 0;
+
+this->_request_raw.resize_and_overwrite(current_size + HEADERS_USUAL_SIZE, [&](char* buf, size_t) {
+  actual_bytes_read = ::read(this->_client_fd, buf + current_size, HEADERS_USUAL_SIZE);
+  if (actual_bytes_read <= 0) return current_size;
+  return current_size + static_cast<size_t>(actual_bytes_read);
+});
+if (actual_bytes_read <= 0) [[unlikely]] return RequestParseError_SocketError;
+
+headers_end = this->_request_raw.find("\r\n\r\n", (search_start >= 3) ? search_start - 3 : 0);
+if (headers_end != std::string::npos) [[likely]] break;
+search_start = this->_request_raw.size();
+```
+The old version read into a stack buffer and then appended that buffer into `_request_raw`. This version uses `resize_and_overwrite` and reads directly into the final string storage.
+
+### Results:
+```sh
+[cpp-web-server] (master) > wrk -t2 -c400 -d10s http://localhost:8888/
+Running 10s test @ http://localhost:8888/
+  2 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    11.54ms    3.28ms  41.19ms   82.84%
+    Req/Sec     4.41k   336.64     5.05k    85.50%
+  87774 requests in 10.04s, 8.87MB read
+  Socket errors: connect 151, read 0, write 0, timeout 0
+Requests/sec:   8744.03
+Transfer/sec:      0.88MB
+
+[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-get.lua http://localhost:8888/
+Running 10s test @ http://localhost:8888/
+  2 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    16.30ms    2.73ms  52.87ms   92.90%
+    Req/Sec     3.19k   230.22     3.50k    86.50%
+  63543 requests in 10.05s, 6.42MB read
+  Socket errors: connect 151, read 0, write 0, timeout 0
+Requests/sec:   6323.34
+Transfer/sec:    654.56KB
+
+[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-post.lua http://localhost:8888/
+Running 10s test @ http://localhost:8888/
+  2 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   874.63ms  122.41ms   1.06s    93.20%
+    Req/Sec    71.42     19.56   141.00     75.00%
+  1411 requests in 10.05s, 146.06KB read
+  Socket errors: connect 151, read 112, write 0, timeout 0
+Requests/sec:    140.38
+Transfer/sec:     14.53KB
+```
