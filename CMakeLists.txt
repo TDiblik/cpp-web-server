@@ -37,7 +37,10 @@ find_package(Threads REQUIRED)
 
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
-add_compile_definitions($<$<CONFIG:Debug>:_GLIBCXX_DEBUG>)
+add_compile_definitions(
+  $<$<CONFIG:Debug>:_GLIBCXX_DEBUG>
+  $<$<CONFIG:Debug>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
+)
 add_link_options($<$<CONFIG:Debug>:-fsanitize=address,undefined>)
 
 add_executable(server)
