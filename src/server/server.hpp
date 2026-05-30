@@ -1,18 +1,12 @@
 #pragma once
 
-#include "request/request.hpp"
+#include "server_worker.hpp"
 
 #include <cstdint>
-#include <functional>
-#include <sys/event.h>
 #include <sys/resource.h>
 
 class Server {
   public:
-    using RequestHandler = std::function<void(Request* req)>;
-
-  private:
-    inline static constexpr int MAX_EVENTS = 256; // best compromise between L1 cache and minimizing syscalls
     inline static const size_t ULIMIT = []() -> size_t {
       const size_t default_fallback = 65536;
       struct rlimit limit;
@@ -24,15 +18,12 @@ class Server {
     }();
 
   private:
-    int _socket_fd;
     uint16_t _port;
     RequestHandler _onHandled;
-    int _kq_ident;
-    std::vector<std::unique_ptr<Request>> _requests;
 
   public:
-    explicit Server(uint16_t port, RequestHandler onHandled);
-    ~Server();
+    explicit Server(uint16_t port, RequestHandler onHandled) : _port(port), _onHandled(onHandled) {}
+    ~Server() = default;
 
     void accept_and_handle();
 

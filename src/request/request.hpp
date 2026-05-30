@@ -13,6 +13,7 @@ using HeaderType = std::pair<HeaderNameType, HeaderValueType>;
 
 class Request {
   friend class Server;
+  friend class ServerWorker;
 
   // constants
   private:
@@ -42,9 +43,9 @@ class Request {
     int _response_iovec_count = 0;
     char _response_header_buf[256];
 
+    int _client_fd;
 
   public:
-    int _client_fd;
     HttpMethod method = HTTP_UNKNOWN;
     std::vector<HeaderType> headers;
     std::string_view path;
@@ -54,10 +55,17 @@ class Request {
     size_t content_length = std::string::npos;
     bool keep_alive = true;
 
+
+
   // functions
   private:
     void _append_header(HeaderType header);
     std::optional<HeaderType> _find_header_raw(HeaderNameType header_name);
+
+    HeadersParseState parse_headers();
+    BodyParseState parse_body();
+    ResponseWriteState resume_response();
+    void reset_state();
 
   public:
     explicit Request(int client_fd);
@@ -67,12 +75,7 @@ class Request {
     Request(const Request&) = delete;
     Request& operator=(const Request&) = delete;
 
-    HeadersParseState parse_headers();
-    BodyParseState parse_body();
-
     std::optional<HeaderValueType> get_header_value(HeaderNameType header_name);
 
     void send_response(ResponseCode code, std::string_view content_type = "text/plain", std::string_view resp_body = {});
-    ResponseWriteState resume_response();
-    void reset_state();
 };

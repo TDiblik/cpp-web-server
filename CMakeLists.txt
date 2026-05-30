@@ -48,6 +48,7 @@ target_include_directories(server PRIVATE src)
 target_sources(server PRIVATE
   src/main.cpp
   src/server/server.hpp src/server/server.cpp
+  src/server/server_worker.hpp src/server/server_worker.cpp
   src/request/enums.hpp src/request/request.hpp src/request/request.cpp
   src/utils/sys.hpp
 )
