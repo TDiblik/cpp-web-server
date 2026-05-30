@@ -31,6 +31,7 @@ Final version of the code can be found at master, all of the other versions are 
 - [4. Blocking Multithreaded Server](#4-blocking-multithreaded-server)
 - [5. Event-Driven Non-Blocking Architecture](#5-event-driven-non-blocking-architecture)
 - [6. Kqueue Event Loop Hot Path Optimizations](#6-kqueue-event-loop-hot-path-optimizations)
+- [7. Multithreaded Kqueue Workers](#7-multithreaded-kqueue-workers)
 
 ## 1. Naive Baseline
 I tried to write a version with as many beginner mistakes as possible. It can be found at commit `072df00e03af5c9978e642f355cda08153a987a0`.
@@ -571,7 +572,6 @@ Transfer/sec:     27.57KB
  --- Complete ---
 ```
 
-
 ## 5. Event-Driven Non-Blocking Architecture
 
 The next optimization was to stop dedicating execution flow to one blocking connection at a time. Instead of waiting inside `accept()`, `read()`, or `writev()`, the server now lets the kernel tell it which file descriptors are ready and only does useful work when there is actual socket progress to make. It can be found at commit `42287ada2cbc789e143710649e50ad0c933f550e`.
@@ -986,3 +986,208 @@ This keeps the event-loop state stable over the lifetime of the connection. A ke
 ### Results
 
 I didn't add new benchmark output for this commit here, because the main new artifact for this step is the profiling screenshot above. The expected win is not from changing the server model again, but from making the existing non-blocking model cheaper per event: fewer rescans, fewer reallocations, and fewer `kevent` registration changes.
+
+## 7. Multithreaded Kqueue Workers
+
+The next optimization was to combine the event-driven architecture with multiple workers. The previous version already handled many sockets efficiently, but the whole `kqueue` loop still ran on one thread. This version moves the implementation into `ServerWorker` and starts one worker per hardware thread. It can be found at commit `c2898b3592414faf7d9f96f0802e712c8dc3f40b`.
+
+### `CMakeLists.txt`
+
+- Add the new worker implementation to the build.
+```cmake
+target_sources(server PRIVATE
+  src/main.cpp
+  src/server/server.hpp src/server/server.cpp
+  src/server/server_worker.hpp src/server/server_worker.cpp
+  src/request/enums.hpp src/request/request.hpp src/request/request.cpp
+  src/utils/sys.hpp
+)
+```
+The event loop is now split out of `Server` and placed into a dedicated `ServerWorker`. This keeps the public server wrapper small while allowing each worker to own its own socket, `kqueue`, and request table.
+
+### `server_worker.hpp & server_worker.cpp`
+
+- Move the full non-blocking event loop into `ServerWorker`.
+```cpp
+class ServerWorker {
+  friend class Server;
+
+  private:
+    inline static constexpr int MAX_EVENTS = 256; // best compromise between L1 cache and minimizing syscalls
+
+    int _socket_fd;
+    uint16_t _port;
+    RequestHandler _onHandled;
+    int _kq_ident;
+    std::vector<std::unique_ptr<Request>> _requests;
+
+  public:
+    explicit ServerWorker(uint16_t port, RequestHandler onHandled);
+    ~ServerWorker();
+
+    void accept_and_handle();
+};
+```
+Each worker now has its own listening socket, its own `kqueue` descriptor, and its own request storage. This avoids sharing the hot event-loop state between threads and keeps the connection state local to the worker that accepted the connection.
+
+- Keep `SO_REUSEPORT` inside every worker.
+```cpp
+set_opt_result = ::setsockopt(this->_socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+if (set_opt_result == -1) throw std::system_error(errno, std::generic_category(), "setting SO_REUSEPORT options failed");
+```
+Since every worker creates its own listening socket on the same port, `SO_REUSEPORT` is what makes this design work. The kernel can distribute new connections across all worker sockets instead of forcing the application to accept on one socket and hand work to other threads manually.
+
+- Batch `kevent` registration for newly accepted connections.
+```cpp
+int new_accept_count = 0;
+struct kevent new_accept_events[MAX_EVENTS];
+
+while (true) {
+  int client_fd = ::accept(this->_socket_fd, nullptr, nullptr);
+  if (client_fd == -1) break;
+
+  int set_opt_result = ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
+  if (set_opt_result == -1) { ::close(client_fd); continue; }
+
+  EV_SET(&new_accept_events[new_accept_count++], client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+  EV_SET(&new_accept_events[new_accept_count++], client_fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
+
+  // ...
+}
+```
+The previous version registered each accepted client with `kevent()` immediately. This version collects read/write registrations into a small stack array and submits them in batches. That reduces kernel transitions when a lot of connections arrive at once.
+
+- Flush the accept-event batch when it fills up.
+```cpp
+if (new_accept_count >= MAX_EVENTS - 1) {
+  if (kevent(this->_kq_ident, new_accept_events, new_accept_count, NULL, 0, NULL) < 0) {
+    for (int j = 0; j < new_accept_count; j += 2) {
+      ::close(static_cast<int>(new_accept_events[j].ident));
+    }
+  }
+  new_accept_count = 0;
+}
+```
+This keeps the stack buffer bounded while still avoiding one syscall per accepted connection. If the batch registration fails, the accepted sockets are closed so we don't leak descriptors.
+
+### `server.hpp & server.cpp`
+
+- Turn `Server` into a lightweight worker launcher.
+```cpp
+class Server {
+  private:
+    uint16_t _port;
+    RequestHandler _onHandled;
+
+  public:
+    explicit Server(uint16_t port, RequestHandler onHandled) : _port(port), _onHandled(onHandled) {}
+    ~Server() = default;
+
+    void accept_and_handle();
+};
+```
+The `Server` class no longer owns a socket or `kqueue` directly. Its job is now to store the shared configuration and spawn workers.
+
+- Spawn one worker per hardware thread.
+```cpp
+unsigned int num_threads = std::thread::hardware_concurrency();
+if (num_threads == 0) num_threads = 8;
+
+std::vector<std::thread> workers;
+workers.reserve(num_threads);
+
+for (unsigned int i = 0; i < num_threads; i++) {
+  workers.emplace_back([this, i]() {
+    (void)i;
+
+    ServerWorker worker(this->_port, this->_onHandled);
+    worker.accept_and_handle();
+  });
+}
+
+for (auto& t : workers) t.join();
+```
+Each worker can process many concurrent sockets, and the machine can use more than one CPU core.
+
+- Pin Linux worker threads to CPU cores.
+```cpp
+#if defined(__IS_LINUX__)
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(i, &cpuset);
+  pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+```
+On Linux, each worker tries to pin itself to a CPU core. This can improve cache locality and reduce scheduler movement when the server is under heavy load. On BSD/macOS this block is skipped.
+
+### `request.hpp`
+
+- Hide parser internals from the public API.
+```cpp
+private:
+  HeadersParseState parse_headers();
+  BodyParseState parse_body();
+  ResponseWriteState resume_response();
+  void reset_state();
+```
+Only `ServerWorker` needs to drive the state machine directly, so the low-level parser/resume functions are now private and exposed through friendship. The application code still only sees `send_response()` and header access.
+
+### `main.cpp`
+
+- Keep the public usage simple.
+```cpp
+Server server(8888, [](Request* req) {
+  req->send_response(ResponseCode_OK, "text/html", "<h1> Hello world! </h1>");
+});
+server.accept_and_handle();
+```
+Even though the server now starts multiple event loops internally, the user-facing API did not get more complicated. `main.cpp` still creates one `Server` and passes a request handler callback.
+
+### Results:
+```sh
+--- Warm-up ---
+Running 5s test @ http://localhost:8888/
+  8 threads and 1000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    10.33ms    4.78ms  18.59ms   61.67%
+    Req/Sec     7.21k   794.95     9.79k    81.00%
+  287111 requests in 5.02s, 30.39MB read
+Requests/sec:  57188.44
+Transfer/sec:      6.05MB
+Waiting 2 seconds for sockets to clear...
+
+--- Baseline ---
+Running 10s test @ http://localhost:8888/
+  8 threads and 10000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    52.03ms   10.90ms 560.93ms   85.16%
+    Req/Sec     5.77k     1.52k    7.18k    85.71%
+  454186 requests in 10.11s, 48.08MB read
+Requests/sec:  44943.60
+Transfer/sec:      4.76MB
+Waiting 2 seconds for sockets to clear...
+
+--- Buffer Allocation & Header Parsing Stress ---
+Running 10s test @ http://localhost:8888/
+  4 threads and 5000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    46.41ms   11.93ms  78.33ms   82.51%
+    Req/Sec     8.84k     1.16k   10.53k    81.25%
+  351765 requests in 10.07s, 37.24MB read
+Requests/sec:  34929.72
+Transfer/sec:      3.70MB
+Waiting 2 seconds for sockets to clear...
+
+--- Heavy Payloads & Fuzzing ---
+Running 15s test @ http://localhost:8888/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   154.96ms  206.85ms   1.19s    88.26%
+    Req/Sec     1.18k     0.87k    3.69k    65.85%
+  9722 requests in 15.04s, 0.93MB read
+  Non-2xx or 3xx responses: 9003
+Requests/sec:    646.34
+Transfer/sec:     63.07KB
+
+ --- Complete ---
+```
