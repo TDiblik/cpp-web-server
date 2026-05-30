@@ -32,6 +32,7 @@ Final version of the code can be found at master, all of the other versions are 
 - [5. Event-Driven Non-Blocking Architecture](#5-event-driven-non-blocking-architecture)
 - [6. Kqueue Event Loop Hot Path Optimizations](#6-kqueue-event-loop-hot-path-optimizations)
 - [7. Multithreaded Kqueue Workers](#7-multithreaded-kqueue-workers)
+- [8. Allocator and Profile-Guided Optimizations](#8-allocator-and-profile-guided-optimizations)
 
 ## 1. Naive Baseline
 I tried to write a version with as many beginner mistakes as possible. It can be found at commit `072df00e03af5c9978e642f355cda08153a987a0`.
@@ -1188,6 +1189,150 @@ Running 15s test @ http://localhost:8888/
   Non-2xx or 3xx responses: 9003
 Requests/sec:    646.34
 Transfer/sec:     63.07KB
+
+ --- Complete ---
+```
+
+
+## 8. Allocator and Profile-Guided Optimizations
+
+The next step was to optimize things outside of the request parsing and socket state machine itself. At this point the server is already event-driven and multi-threaded, so the remaining gains are more about helping the compiler and runtime make better decisions. It can be found at commit `3420f4bdb6f3df1f4b4449529a046e0686529377`.
+
+### `CMakeLists.txt`
+
+- Add a configurable PGO mode.
+```cmake
+set(ENABLE_PGO "OFF" CACHE STRING "Enable Profile Guided Optimization")
+set_property(CACHE ENABLE_PGO PROPERTY STRINGS "OFF" "GENERATE" "CS_GENERATE" "USE")
+
+if(ENABLE_PGO STREQUAL "GENERATE")
+  add_compile_options(-fprofile-generate)
+  add_link_options(-fprofile-generate)
+elseif(ENABLE_PGO STREQUAL "CS_GENERATE")
+  add_compile_options(-fcs-profile-generate)
+  add_link_options(-fcs-profile-generate)
+elseif(ENABLE_PGO STREQUAL "USE")
+  add_compile_options(-fprofile-use=${CMAKE_SOURCE_DIR}/pgo.profdata)
+  add_link_options(-fprofile-use=${CMAKE_SOURCE_DIR}/pgo.profdata)
+endif()
+```
+This adds three build modes around profile-guided optimization. `GENERATE` builds a binary that records what actually happens under load. `USE` then feeds the merged profile back into the compiler so it can make better inlining, layout, and branch decisions for the real workload. `OFF` keeps normal builds simple when no profile exists.
+
+- Link against `jemalloc`.
+```cmake
+find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h)
+find_library(JEMALLOC_LIBRARY jemalloc)
+if (NOT JEMALLOC_INCLUDE_DIR OR NOT JEMALLOC_LIBRARY)
+  message(FATAL_ERROR "jemalloc not found! (e.g. run `brew install jemalloc`)")
+endif()
+
+target_include_directories(server PRIVATE src ${JEMALLOC_INCLUDE_DIR})
+target_link_libraries(server ${CMAKE_THREAD_LIBS_INIT} ${JEMALLOC_LIBRARY})
+```
+The server creates, resets, and reuses many request-related objects under load. `jemalloc` is generally better suited for highly concurrent allocation-heavy workloads than the default allocator, especially once the server is running multiple workers.
+
+### `scripts/pgo_generate.sh`
+
+- Build a server and run the stress test.
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_PGO=GENERATE
+cmake --build build -j
+
+LLVM_PROFILE_FILE="pgo.profraw" ./build/server &
+SERVER_PID=$!
+
+sleep 2
+./scripts/stress_test.sh
+```
+This builds with PGO enabled, starts the server, and then runs the benchmark suite to collect realistic execution data. The goal is for the profile to represent the real workload.
+
+- Merge raw profile data into `pgo.profdata`.
+```sh
+kill -SIGINT $SERVER_PID
+wait $SERVER_PID
+
+xcrun llvm-profdata merge -output=pgo.profdata pgo.profraw
+```
+
+### `scripts/start_server.sh`
+
+- Automatically use PGO when profile data exists.
+```sh
+if [ -f "pgo.profdata" ]; then
+  echo "Found pgo.profdata. Building with PGO USE..."
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_PGO=USE
+else
+  echo "No pgo.profdata found. Building without PGO..."
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_PGO=OFF
+fi
+```
+
+### How to generate PGO
+
+```sh
+# Terminal 1 (Server)
+## Step 1: Make all scripts executable
+dos2unix ./scripts/*.sh
+chmod +x ./scripts/*.sh
+
+## Step 2: Generate PGO data
+./scripts/pgo_generate.sh
+
+## Step 3: Start the optimized server (Terminal 1)
+./scripts/start_server.sh
+
+# Terminal 2 (Stress Testing)
+dos2unix ./scripts/*.sh
+chmod +x ./scripts/*.sh
+./scripts/stress_test.sh
+```
+
+### Results:
+```sh
+--- Warm-up ---
+Running 5s test @ http://localhost:8888/
+  8 threads and 1000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     9.77ms    4.86ms  18.24ms   59.40%
+    Req/Sec     7.35k     0.89k   10.04k    77.50%
+  292368 requests in 5.02s, 30.95MB read
+Requests/sec:  58247.97
+Transfer/sec:      6.17MB
+Waiting 2 seconds for sockets to clear...
+
+--- Baseline ---
+Running 10s test @ http://localhost:8888/
+  8 threads and 10000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    64.79ms   48.28ms   1.06s    97.68%
+    Req/Sec     5.26k     1.68k    7.44k    81.38%
+  411132 requests in 10.02s, 43.52MB read
+  Socket errors: connect 0, read 6821, write 0, timeout 0
+Requests/sec:  41037.85
+Transfer/sec:      4.34MB
+Waiting 2 seconds for sockets to clear...
+
+--- Buffer Allocation & Header Parsing Stress ---
+Running 10s test @ http://localhost:8888/
+  4 threads and 5000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    50.49ms   11.09ms  77.15ms   84.87%
+    Req/Sec     8.79k     1.21k   11.31k    82.25%
+  349828 requests in 10.08s, 37.03MB read
+Requests/sec:  34701.17
+Transfer/sec:      3.67MB
+Waiting 2 seconds for sockets to clear...
+
+--- Heavy Payloads & Fuzzing ---
+Running 15s test @ http://localhost:8888/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    75.19ms  153.90ms   1.13s    88.92%
+    Req/Sec   789.34    815.69     4.04k    85.16%
+  10098 requests in 15.04s, 0.98MB read
+  Non-2xx or 3xx responses: 8334
+Requests/sec:    671.28
+Transfer/sec:     66.45KB
 
  --- Complete ---
 ```
