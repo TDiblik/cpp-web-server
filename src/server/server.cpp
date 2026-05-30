@@ -83,9 +83,10 @@ void Server::accept_and_handle() {
           int set_opt_result = ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
           if (set_opt_result == -1) { ::close(client_fd); continue; }
 
-          struct kevent change_event;
-          EV_SET(&change_event, client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
-          int kevent_result = kevent(this->_kq_ident, &change_event, 1, NULL, 0, NULL);
+          struct kevent changes[2];
+          EV_SET(&changes[0], client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+          EV_SET(&changes[1], client_fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
+          int kevent_result = kevent(this->_kq_ident, changes, 2, NULL, 0, NULL);
           if (kevent_result < 0) { ::close(client_fd); continue; }
 
           auto& req = this->_requests[static_cast<size_t>(client_fd)];
@@ -156,8 +157,8 @@ void Server::accept_and_handle() {
 
           if (current_request->write_state == ResponseWriteState_NotFinished) {
             struct kevent changes[2];
-            EV_SET(&changes[0], current_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-            EV_SET(&changes[1], current_fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+            EV_SET(&changes[0], current_fd, EVFILT_READ, EV_DISABLE, 0, 0, NULL);
+            EV_SET(&changes[1], current_fd, EVFILT_WRITE, EV_ENABLE, 0, 0, NULL);
             kevent(this->_kq_ident, changes, 2, NULL, 0, NULL);
           }
         }
@@ -169,8 +170,8 @@ void Server::accept_and_handle() {
             if (!current_request->keep_alive) close_and_continue();
             if (event.filter == EVFILT_WRITE) {
               struct kevent changes[2];
-              EV_SET(&changes[0], current_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-              EV_SET(&changes[1], current_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+              EV_SET(&changes[0], current_fd, EVFILT_WRITE, EV_DISABLE, 0, 0, NULL);
+              EV_SET(&changes[1], current_fd, EVFILT_READ, EV_ENABLE, 0, 0, NULL);
               kevent(this->_kq_ident, changes, 2, NULL, 0, NULL);
             }
             current_request->reset_state();

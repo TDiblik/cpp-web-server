@@ -29,6 +29,9 @@ class Request {
 
     // IN-CLASS INITIALIZATION FOR DEFAULTS
     HeadersParseState _headers_parsing_state = HeadersParseState_NotFinished;
+    size_t _req_line_end = std::string::npos;
+    size_t _req_line_scanned_pos = 0;
+    size_t _headers_scanned_pos = 0;
     size_t _headers_parsing_search_start = std::string::npos;
     size_t _headers_parsing_search_end = std::string::npos;
 

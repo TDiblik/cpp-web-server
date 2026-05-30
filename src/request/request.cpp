@@ -23,9 +23,14 @@ HeadersParseState Request::parse_headers() {
 
   // read req line + headers
   size_t current_size = this->_request_raw.size();
+  size_t target_size = current_size + HEADERS_USUAL_SIZE;
+  if (this->_request_raw.capacity() < target_size) {
+    this->_request_raw.reserve(std::max(target_size, this->_request_raw.capacity() * 2));
+  }
+
   ssize_t actual_bytes_read = 0;
-  this->_request_raw.resize_and_overwrite(current_size + HEADERS_USUAL_SIZE, [&](char* buf, size_t) {
-    actual_bytes_read = ::read(this->_client_fd, buf + current_size, HEADERS_USUAL_SIZE);
+  this->_request_raw.resize_and_overwrite(this->_request_raw.capacity(), [&](char* buf, size_t buf_capacity) {
+    actual_bytes_read = ::read(this->_client_fd, buf + current_size, buf_capacity - current_size);
     if (actual_bytes_read <= 0) return current_size;
     return current_size + static_cast<size_t>(actual_bytes_read);
   });
@@ -37,18 +42,29 @@ HeadersParseState Request::parse_headers() {
   if (this->_request_raw.size() >= HEADERS_MAX_SIZE) [[unlikely]] exit_fn(HeadersParseState_TooLargeError);
 
   // Make sure req line is fully read
-  size_t req_line_end = this->_request_raw.find("\r\n");
-  if (req_line_end == std::string::npos && this->_request_raw.size() <= REQ_LINE_MAX_LEN) [[unlikely]] exit_fn(HeadersParseState_NotFinished);
-  if (req_line_end == std::string::npos) [[unlikely]] exit_fn(HeadersParseState_MalformedRequest);
+  if (this->_req_line_end == std::string::npos) {
+    size_t req_search_start = (this->_req_line_scanned_pos >= 1) ? this->_req_line_scanned_pos - 1 : 0;
+    this->_req_line_end = this->_request_raw.find("\r\n", req_search_start);
+    if (this->_req_line_end == std::string::npos) [[unlikely]] {
+      this->_req_line_scanned_pos = this->_request_raw.size();
+      if (this->_request_raw.size() > REQ_LINE_MAX_LEN) [[unlikely]] exit_fn(HeadersParseState_MalformedRequest);
+      exit_fn(HeadersParseState_NotFinished);
+    }
+  }
 
   // Make sure headers are fully read up until the end
-  this->_headers_parsing_search_start = req_line_end + 2;
-  this->_headers_parsing_search_end = this->_request_raw.find("\r\n\r\n", (this->_headers_parsing_search_start >= 3) ? this->_headers_parsing_search_start - 3 : 0);
-  if (this->_headers_parsing_search_end == std::string::npos) [[unlikely]] exit_fn(HeadersParseState_NotFinished);
+  this->_headers_parsing_search_start = this->_req_line_end + 2;
+  size_t search_start = (this->_headers_scanned_pos >= 3) ? this->_headers_scanned_pos - 3 : 0;
+  this->_headers_parsing_search_end = this->_request_raw.find("\r\n\r\n", search_start);
+  if (this->_headers_parsing_search_end == std::string::npos) [[unlikely]] {
+    this->_headers_scanned_pos = this->_request_raw.size();
+    if (this->_request_raw.size() >= HEADERS_MAX_SIZE) [[unlikely]] exit_fn(HeadersParseState_TooLargeError);
+    exit_fn(HeadersParseState_NotFinished);
+  }
 
   // parse request line (example: `GET /some/path HTTP/1.1`)
   {
-    std::string_view req_line(this->_request_raw.data(), req_line_end);
+    std::string_view req_line(this->_request_raw.data(), this->_req_line_end);
     size_t first_space = req_line.find(' ');
     size_t second_space = req_line.find(' ', first_space + 1);
     if (first_space == std::string::npos || second_space == std::string::npos) [[unlikely]] exit_fn(HeadersParseState_MalformedRequest);
@@ -137,10 +153,16 @@ BodyParseState Request::parse_body() {
   if (body_already_read < this->content_length) {
     size_t bytes_remaining = this->content_length - body_already_read;
     size_t current_size = this->_request_raw.size();
-    ssize_t actual_bytes_read = 0;
+    size_t target_size = current_size + bytes_remaining;
 
-    this->_request_raw.resize_and_overwrite(current_size + bytes_remaining, [&](char* buf, size_t) {
-      actual_bytes_read = ::read(this->_client_fd, buf + current_size, bytes_remaining);
+    if (this->_request_raw.capacity() < target_size) {
+      this->_request_raw.reserve(std::max(target_size, this->_request_raw.capacity() * 2));
+    }
+
+    ssize_t actual_bytes_read = 0;
+    this->_request_raw.resize_and_overwrite(this->_request_raw.capacity(), [&](char* buf, size_t buf_capacity) {
+      size_t max_read = std::min(buf_capacity - current_size, bytes_remaining);
+      actual_bytes_read = ::read(this->_client_fd, buf + current_size, max_read);
       if (actual_bytes_read <= 0) return current_size;
       return current_size + static_cast<size_t>(actual_bytes_read);
     });
@@ -270,6 +292,9 @@ void Request::reset_state() {
 
   this->headers.clear();
   this->_headers_parsing_state = HeadersParseState_NotFinished;
+  this->_req_line_end = std::string::npos;
+  this->_req_line_scanned_pos = 0;
+  this->_headers_scanned_pos = 0;
   this->_headers_parsing_search_start = std::string::npos;
   this->_headers_parsing_search_end = std::string::npos;
 
