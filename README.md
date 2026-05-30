@@ -9,26 +9,14 @@ I'll present each version chronologically, starting from the intentionally naive
 For compilation and (quick) testing of each version I used:
 ```sh
 # Terminal 1 (Server)
-ulimit -n 65536
-rm -rf build/
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/server
+dos2unix ./scripts/start_server.sh
+chmod +x ./scripts/start_server.sh
+./scripts/start_server.sh
 
 # Terminal 2 (Stress Testing)
-ulimit -n 65536
-
-# Purpose: Tests the kqueue event loop's ability to accept connections and multiplex tiny payloads 
-# without hitting TCP listen backlog drops or 100% CPU deadlocks.
-wrk -t8 -c10000 -d10s --timeout 5s http://localhost:8888/ 
-
-# Purpose: The lua script generates an 'X-Large-Header' up to ~60KB. This forces Request object to continuously trigger its resize_and_overwrite() logic and 
-# pushes right up against your HEADERS_MAX_SIZE (65536 bytes) limit to test for OOMs or bounds errors.
-wrk -t4 -c5000 -d10s --timeout 5s -s scripts/wrk-get.lua http://localhost:8888/ 
-
-# Purpose: Generates huge request bodies (1MB to ~9.4MB), staying just under BODY_MAX_SIZE (10MB). It also has a 20% chance to inject a 40KB chaos header. 
-# Tests the scatter/gather I/O handling of large memory blocks and the state machine's ability to transition cleanly from giant headers to giant bodies.
-wrk -t4 -c100 -d15s --timeout 15s -s scripts/wrk-post.lua http://localhost:8888/
+dos2unix ./scripts/stress_test.sh
+chmod +x ./scripts/stress_test.sh
+./scripts/stress_test.sh
 ```
 
 Initial optimizations are significant enough that we don't need to measure it using professional tooling.
@@ -50,38 +38,52 @@ TLDR;
 
 ### Results:
 ```sh
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s http://localhost:8888/
-Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+--- Warm-up ---
+Running 5s test @ http://localhost:8888/
+  8 threads and 1000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    81.65ms    4.49ms  94.26ms   94.66%
-    Req/Sec   786.51     43.13     0.91k    68.50%
-  15656 requests in 10.04s, 1.58MB read
-  Socket errors: connect 151, read 91, write 0, timeout 0
-Requests/sec:   1559.13
-Transfer/sec:    161.40KB
+    Latency    72.11ms    5.29ms  76.25ms   98.58%
+    Req/Sec   221.79     47.80   330.00     66.00%
+  8862 requests in 5.08s, 0.90MB read
+Requests/sec:   1743.08
+Transfer/sec:    180.45KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-get.lua http://localhost:8888/
+--- Baseline ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  8 threads and 10000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.01s   582.17ms   1.99s    57.89%
-    Req/Sec    29.98      5.37    40.00     72.36%
-  602 requests in 10.10s, 62.32KB read
-  Socket errors: connect 151, read 120, write 0, timeout 488
-Requests/sec:     59.61
-Transfer/sec:      6.17KB
+    Latency   100.85ms   47.95ms 742.27ms   96.44%
+    Req/Sec   162.41     51.49   330.00     72.34%
+  12240 requests in 10.06s, 1.24MB read
+  Socket errors: connect 0, read 9406, write 0, timeout 0
+Requests/sec:   1217.24
+Transfer/sec:    126.00KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-post.lua http://localhost:8888/
+--- Buffer Allocation & Header Parsing Stress ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  4 threads and 5000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.06s   547.55ms   1.98s    57.69%
-    Req/Sec    20.73      6.85    50.00     77.01%
-  398 requests in 10.10s, 41.20KB read
-  Socket errors: connect 151, read 120, write 0, timeout 320
-Requests/sec:     39.42
-Transfer/sec:      4.08KB
+    Latency     1.23s   253.55ms   1.43s    90.80%
+    Req/Sec    24.75     11.43    70.00     63.90%
+  957 requests in 10.10s, 99.06KB read
+  Socket errors: connect 0, read 4833, write 0, timeout 0
+Requests/sec:     94.78
+Transfer/sec:      9.81KB
+Waiting 2 seconds for sockets to clear...
+
+--- Heavy Payloads & Fuzzing ---
+Running 15s test @ http://localhost:8888/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   541.07ms   94.65ms 814.67ms   70.61%
+    Req/Sec    45.23     14.96    90.00     65.20%
+  2702 requests in 15.04s, 279.70KB read
+Requests/sec:    179.64
+Transfer/sec:     18.60KB
+
+ --- Complete ---
 ```
 
 ## Optimize parsing
@@ -218,39 +220,52 @@ The functions that assign values into them are going to rewrite them anyways.
 
 ### Results:
 ```sh
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s http://localhost:8888/
-Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+--- Warm-up ---
+Running 5s test @ http://localhost:8888/
+  8 threads and 1000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    15.31ms    2.61ms  52.98ms   95.07%
-    Req/Sec     3.85k   288.60     4.25k    84.50%
-  76528 requests in 10.04s, 7.74MB read
-  Socket errors: connect 151, read 0, write 0, timeout 0
-Requests/sec:   7622.41
-Transfer/sec:    789.04KB
+    Latency    17.57ms    1.43ms  29.54ms   93.69%
+    Req/Sec     0.90k   115.18     1.25k    70.75%
+  35948 requests in 5.08s, 3.63MB read
+Requests/sec:   7079.03
+Transfer/sec:    732.79KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-get.lua http://localhost:8888/
+--- Baseline ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  8 threads and 10000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    16.55ms    2.33ms  34.63ms   82.80%
-    Req/Sec     2.96k   187.33     3.46k    81.50%
-  58932 requests in 10.04s, 5.96MB read
-  Socket errors: connect 151, read 0, write 0, timeout 0
-Requests/sec:   5871.20
-Transfer/sec:    607.76KB
+    Latency    34.76ms   40.28ms 741.95ms   97.21%
+    Req/Sec   470.78    198.43     1.01k    72.93%
+  34627 requests in 10.10s, 3.50MB read
+  Socket errors: connect 0, read 8363, write 0, timeout 0
+Requests/sec:   3429.89
+Transfer/sec:    355.05KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-post.lua http://localhost:8888/
+--- Buffer Allocation & Header Parsing Stress ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  4 threads and 5000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   142.90ms   43.44ms 210.26ms   78.86%
-    Req/Sec   284.78    161.37   690.00     64.49%
-  5195 requests in 10.05s, 16.25KB read
-  Socket errors: connect 151, read 5033, write 1298, timeout 0
-  Non-2xx or 3xx responses: 5099
-Requests/sec:    517.00
-Transfer/sec:      1.62KB
+    Latency    28.22ms   11.11ms 148.02ms   94.49%
+    Req/Sec     1.12k   286.13     1.62k    79.38%
+  43437 requests in 10.04s, 4.39MB read
+  Socket errors: connect 0, read 4102, write 0, timeout 0
+Requests/sec:   4328.17
+Transfer/sec:    448.03KB
+Waiting 2 seconds for sockets to clear...
+
+--- Heavy Payloads & Fuzzing ---
+Running 15s test @ http://localhost:8888/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   287.08ms   32.24ms 375.03ms   68.26%
+    Req/Sec    71.27     18.65   141.00     65.88%
+  4244 requests in 15.05s, 439.32KB read
+Requests/sec:    281.94
+Transfer/sec:     29.19KB
+
+ --- Complete ---
 ```
 
 ## Other flow micro-optimizations
@@ -380,39 +395,52 @@ Replacing multiple `send()` calls with a single `writev()` using `iovec` avoids 
 
 ### Results:
 ```sh
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s http://localhost:8888/
-Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+--- Warm-up ---
+Running 5s test @ http://localhost:8888/
+  8 threads and 1000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    12.54ms    3.86ms  62.90ms   93.58%
-    Req/Sec     4.30k   560.50     4.93k    86.87%
-  85574 requests in 10.06s, 8.65MB read
-  Socket errors: connect 151, read 0, write 0, timeout 0
-Requests/sec:   8504.73
-Transfer/sec:      0.86MB
+    Latency    16.57ms    1.85ms  33.91ms   94.28%
+    Req/Sec     0.96k   136.06     1.36k    68.25%
+  38083 requests in 5.07s, 3.85MB read
+Requests/sec:   7506.97
+Transfer/sec:    777.09KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-get.lua http://localhost:8888/
+--- Baseline ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  8 threads and 10000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    15.80ms    2.00ms  35.43ms   96.65%
-    Req/Sec     3.36k   201.54     3.76k    79.50%
-  66978 requests in 10.03s, 6.77MB read
-  Socket errors: connect 151, read 0, write 0, timeout 0
-Requests/sec:   6675.49
-Transfer/sec:    691.02KB
+    Latency    30.90ms   36.95ms 851.45ms   97.53%
+    Req/Sec   538.34    223.37     1.02k    70.90%
+  39402 requests in 10.06s, 3.98MB read
+  Socket errors: connect 0, read 8085, write 0, timeout 0
+Requests/sec:   3915.14
+Transfer/sec:    405.28KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-post.lua http://localhost:8888/
+--- Buffer Allocation & Header Parsing Stress ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  4 threads and 5000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   141.95ms   41.95ms 200.42ms   79.84%
-    Req/Sec   263.54    155.84   666.00     67.24%
-  3998 requests in 10.09s, 10.98KB read
-  Socket errors: connect 151, read 3890, write 1334, timeout 0
-  Non-2xx or 3xx responses: 3916
-Requests/sec:    396.19
-Transfer/sec:      1.09KB
+    Latency    25.80ms   11.76ms 193.87ms   95.50%
+    Req/Sec     1.23k   313.98     1.74k    77.06%
+  47584 requests in 10.09s, 4.81MB read
+  Socket errors: connect 0, read 3997, write 0, timeout 0
+Requests/sec:   4717.43
+Transfer/sec:    488.33KB
+Waiting 2 seconds for sockets to clear...
+
+--- Heavy Payloads & Fuzzing ---
+Running 15s test @ http://localhost:8888/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   279.40ms   26.50ms 412.50ms   66.91%
+    Req/Sec    72.86     17.92   130.00     75.47%
+  4333 requests in 15.10s, 448.53KB read
+Requests/sec:    286.98
+Transfer/sec:     29.71KB
+
+ --- Complete ---
 ```
 
 
@@ -486,36 +514,50 @@ The old version read into a stack buffer and then appended that buffer into `_re
 
 ### Results:
 ```sh
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s http://localhost:8888/
-Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+--- Warm-up ---
+Running 5s test @ http://localhost:8888/
+  8 threads and 1000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    11.54ms    3.28ms  41.19ms   82.84%
-    Req/Sec     4.41k   336.64     5.05k    85.50%
-  87774 requests in 10.04s, 8.87MB read
-  Socket errors: connect 151, read 0, write 0, timeout 0
-Requests/sec:   8744.03
-Transfer/sec:      0.88MB
+    Latency    16.04ms    1.65ms  30.64ms   93.32%
+    Req/Sec     0.99k   134.50     1.35k    64.75%
+  39328 requests in 5.07s, 3.98MB read
+Requests/sec:   7753.29
+Transfer/sec:    802.59KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-get.lua http://localhost:8888/
+--- Baseline ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  8 threads and 10000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    16.30ms    2.73ms  52.87ms   92.90%
-    Req/Sec     3.19k   230.22     3.50k    86.50%
-  63543 requests in 10.05s, 6.42MB read
-  Socket errors: connect 151, read 0, write 0, timeout 0
-Requests/sec:   6323.34
-Transfer/sec:    654.56KB
+    Latency    32.80ms   72.04ms   1.36s    98.62%
+    Req/Sec   534.14    228.20     1.03k    71.86%
+  37074 requests in 10.10s, 3.75MB read
+  Socket errors: connect 0, read 8081, write 0, timeout 0
+Requests/sec:   3669.76
+Transfer/sec:    379.88KB
+Waiting 2 seconds for sockets to clear...
 
-[cpp-web-server] (master) > wrk -t2 -c400 -d10s -s scripts/wrk-post.lua http://localhost:8888/
+--- Buffer Allocation & Header Parsing Stress ---
 Running 10s test @ http://localhost:8888/
-  2 threads and 400 connections
+  4 threads and 5000 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   874.63ms  122.41ms   1.06s    93.20%
-    Req/Sec    71.42     19.56   141.00     75.00%
-  1411 requests in 10.05s, 146.06KB read
-  Socket errors: connect 151, read 112, write 0, timeout 0
-Requests/sec:    140.38
-Transfer/sec:     14.53KB
+    Latency    26.35ms   10.72ms 136.02ms   93.97%
+    Req/Sec     1.20k   323.93     1.91k    76.03%
+  46537 requests in 10.04s, 4.70MB read
+  Socket errors: connect 0, read 3951, write 0, timeout 0
+Requests/sec:   4634.43
+Transfer/sec:    479.74KB
+Waiting 2 seconds for sockets to clear...
+
+--- Heavy Payloads & Fuzzing ---
+Running 15s test @ http://localhost:8888/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   283.28ms   57.80ms 462.15ms   69.37%
+    Req/Sec    67.40     16.92   111.00     64.30%
+  4022 requests in 15.10s, 416.34KB read
+Requests/sec:    266.33
+Transfer/sec:     27.57KB
+
+ --- Complete ---
 ```
