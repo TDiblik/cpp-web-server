@@ -49,6 +49,7 @@ target_sources(server PRIVATE
   src/main.cpp
   src/server/server.hpp src/server/server.cpp
   src/request/enums.hpp src/request/request.hpp src/request/request.cpp
+  src/utils/sys.hpp
 )
 
 target_link_libraries(server ${CMAKE_THREAD_LIBS_INIT})

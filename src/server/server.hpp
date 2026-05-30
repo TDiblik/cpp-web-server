@@ -1,20 +1,41 @@
 #pragma once
 
+#include "request/request.hpp"
+
 #include <cstdint>
+#include <functional>
+#include <sys/event.h>
+#include <sys/resource.h>
 
 class Server {
+  public:
+    using RequestHandler = std::function<void(Request* req)>;
+
+  private:
+    inline static constexpr int MAX_EVENTS = 256; // best compromise between L1 cache and minimizing syscalls
+    inline static const size_t ULIMIT = []() -> size_t {
+      const size_t default_fallback = 65536;
+      struct rlimit limit;
+      if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+        if (limit.rlim_cur == RLIM_INFINITY) return default_fallback;
+        return limit.rlim_cur;
+      }
+      return default_fallback;
+    }();
+
   private:
     int _socket_fd;
     uint16_t _port;
-    bool _log_ip;
+    RequestHandler _onHandled;
+    int _kq_ident;
+    std::vector<std::unique_ptr<Request>> _requests;
 
   public:
-    explicit Server(uint16_t port, bool log_ip = false);
+    explicit Server(uint16_t port, RequestHandler onHandled);
     ~Server();
 
-    int accept();
+    void accept_and_handle();
 
-    // prevent copies, since it owns the file descriptor
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 };

@@ -5,14 +5,18 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <sys/uio.h>
 
 using HeaderNameType = std::string_view;
 using HeaderValueType = std::string_view;
 using HeaderType = std::pair<HeaderNameType, HeaderValueType>;
 
 class Request {
+  friend class Server;
+
   // constants
   private:
+    inline static constexpr uint32_t REQ_LINE_MAX_LEN = 512; // 99% of headers will be this length
     inline static constexpr uint32_t HEADERS_USUAL_SIZE = 4096; // 99% of headers will be this length
     inline static constexpr uint32_t HEADERS_MAX_SIZE = 65536; // 64KB
     inline static constexpr uint32_t USUAL_NUMBER_OF_HEADERS = 25;
@@ -22,18 +26,35 @@ class Request {
   private:
     std::string _request_raw;
     std::string_view _headers_raw;
-    int _client_fd;
+
+    // IN-CLASS INITIALIZATION FOR DEFAULTS
+    HeadersParseState _headers_parsing_state = HeadersParseState_NotFinished;
+    size_t _headers_parsing_search_start = std::string::npos;
+    size_t _headers_parsing_search_end = std::string::npos;
+
+    BodyParseState _body_parsing_state = BodyParseState_NotFinished;
+    size_t _body_start = std::string::npos;
+
+    struct iovec _response_iovecs[2];
+    int _response_iovec_count = 0;
+    char _response_header_buf[256];
+
+
   public:
-    HttpMethod method;
+    int _client_fd;
+    HttpMethod method = HTTP_UNKNOWN;
     std::vector<HeaderType> headers;
     std::string_view path;
     std::string_view protocol;
     std::string_view body;
+    ResponseWriteState write_state = ResponseWriteState_Idle;
+    size_t content_length = std::string::npos;
+    bool keep_alive = true;
 
   // functions
   private:
-    std::optional<HeaderType> _find_header_raw(HeaderNameType header_name);
     void _append_header(HeaderType header);
+    std::optional<HeaderType> _find_header_raw(HeaderNameType header_name);
 
   public:
     explicit Request(int client_fd);
@@ -43,7 +64,12 @@ class Request {
     Request(const Request&) = delete;
     Request& operator=(const Request&) = delete;
 
-    RequestParseError parse();
+    HeadersParseState parse_headers();
+    BodyParseState parse_body();
+
     std::optional<HeaderValueType> get_header_value(HeaderNameType header_name);
+
     void send_response(ResponseCode code, std::string_view content_type = "text/plain", std::string_view resp_body = {});
+    ResponseWriteState resume_response();
+    void reset_state();
 };
