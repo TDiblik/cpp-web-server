@@ -2,3 +2,5 @@ build/
 .cache/
 __cmake*
 .DS_Store
+pgo.profraw
+pgo.profdata

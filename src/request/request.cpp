@@ -220,7 +220,7 @@ void Request::send_response(ResponseCode code, std::string_view content_type, st
     this->keep_alive ? "keep-alive" : "close"
   );
 
-  if (header_len < 0 || static_cast<size_t>(header_len) >= sizeof(this->_response_header_buf)) {
+  if (header_len < 0 || static_cast<size_t>(header_len) >= sizeof(this->_response_header_buf)) [[unlikely]] {
     this->write_state = ResponseWriteState_SocketError;
     return;
   }

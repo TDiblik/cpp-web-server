@@ -81,10 +81,10 @@ void ServerWorker::accept_and_handle() {
 
         while (true) {
           int client_fd = ::accept(this->_socket_fd, nullptr, nullptr);
-          if (client_fd == -1) break;
+          if (client_fd == -1) [[unlikely]] break;
 
           int set_opt_result = ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
-          if (set_opt_result == -1) { ::close(client_fd); continue; }
+          if (set_opt_result == -1) [[unlikely]] { ::close(client_fd); continue; }
 
           EV_SET(&new_accept_events[new_accept_count++], client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
           EV_SET(&new_accept_events[new_accept_count++], client_fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
@@ -98,7 +98,7 @@ void ServerWorker::accept_and_handle() {
           }
 
           if (new_accept_count >= MAX_EVENTS - 1) {
-            if (kevent(this->_kq_ident, new_accept_events, new_accept_count, NULL, 0, NULL) < 0) {
+            if (kevent(this->_kq_ident, new_accept_events, new_accept_count, NULL, 0, NULL) < 0) [[unlikely]] {
               for (int j = 0; j < new_accept_count; j += 2) {
                 ::close(static_cast<int>(new_accept_events[j].ident));
               }
@@ -108,7 +108,7 @@ void ServerWorker::accept_and_handle() {
         }
 
         if (new_accept_count > 0) {
-          if (kevent(this->_kq_ident, new_accept_events, new_accept_count, NULL, 0, NULL) < 0) {
+          if (kevent(this->_kq_ident, new_accept_events, new_accept_count, NULL, 0, NULL) < 0) [[unlikely]] {
               for (int j = 0; j < new_accept_count; j += 2) {
                 ::close(static_cast<int>(new_accept_events[j].ident));
               }
@@ -133,7 +133,7 @@ void ServerWorker::accept_and_handle() {
       }
 
       if (current_request == nullptr) [[unlikely]] close_and_continue();
-      if (event.flags & EV_EOF && current_request->write_state == ResponseWriteState_Idle && current_request->_request_raw.empty()) {
+      if (event.flags & EV_EOF && current_request->write_state == ResponseWriteState_Idle && current_request->_request_raw.empty()) [[unlikely]] {
         close_and_continue();
       }
 
