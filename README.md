@@ -30,6 +30,7 @@ Final version of the code can be found at master, all of the other versions are 
 - [3. Data Layout and I/O Micro-Optimizations](#3-data-layout-and-io-micro-optimizations)
 - [4. Blocking Multithreaded Server](#4-blocking-multithreaded-server)
 - [5. Event-Driven Non-Blocking Architecture](#5-event-driven-non-blocking-architecture)
+- [6. Kqueue Event Loop Hot Path Optimizations](#6-kqueue-event-loop-hot-path-optimizations)
 
 ## 1. Naive Baseline
 I tried to write a version with as many beginner mistakes as possible. It can be found at commit `072df00e03af5c9978e642f355cda08153a987a0`.
@@ -570,6 +571,7 @@ Transfer/sec:     27.57KB
  --- Complete ---
 ```
 
+
 ## 5. Event-Driven Non-Blocking Architecture
 
 The next optimization was to stop dedicating execution flow to one blocking connection at a time. Instead of waiting inside `accept()`, `read()`, or `writev()`, the server now lets the kernel tell it which file descriptors are ready and only does useful work when there is actual socket progress to make. It can be found at commit `42287ada2cbc789e143710649e50ad0c933f550e`.
@@ -591,7 +593,7 @@ The next optimization was to stop dedicating execution flow to one blocking conn
     #error "Unknown and unsupported operating system."
 #endif
 ```
-This is mostly groundwork for separating platform-specific networking code. The current implementation uses `kqueue`, which is available on macOS and BSD systems, but the project can now branch cleanly for Linux-specific code later.
+This is mostly groundwork for separating platform-specific networking code. The current implementation uses `kqueue`, which is available on macOS and BSD systems, but the project can now branch cleanly for Linux specific code later.
 
 ### `enums.hpp`
 
@@ -859,3 +861,128 @@ Transfer/sec:     42.78KB
 
  --- Complete ---
 ```
+
+
+## 6. Kqueue Event Loop Hot Path Optimizations
+
+After implementing the first non-blocking architecture, I profiled the server and speed-up the places that were still doing unnecessary work in the event loop and parser. This commit keeps the same `kqueue`-based architecture, but removes some repeated scanning, avoids repeated kevent delete/add churn, and makes request-buffer growth behave more predictably. It can be found at commit `63dea2dc1240c1a6dedcd14a1db171057b8f6f30`.
+
+### Profiling
+
+The profiling screenshot for the version right after the first non-blocking implementation can be found here:
+
+![Profiling after initial non-blocking event-driven architecture](readme/profiling-after-initial-non-blocking-event-driven-architecture.png)
+
+This profile was useful because the previous step already removed the obvious blocking bottleneck. At this point, the remaining improvements are more about shaving off repeated work in the hot path: less rescanning, fewer allocations, and fewer event-registration changes.
+
+### `request.hpp & request.cpp`
+
+- Track request-line and header scan progress.
+```cpp
+size_t _req_line_end = std::string::npos;
+size_t _req_line_scanned_pos = 0;
+size_t _headers_scanned_pos = 0;
+```
+The previous non-blocking parser could return `NotFinished`, then re-enter later and search from the beginning again. That is not a correctness bug, but it is wasted work in exactly the path that runs the most. These fields remember how much of the input buffer was already scanned, so the next parser pass resumes close to where the previous one stopped.
+
+- Resume request-line scanning instead of starting from zero.
+```cpp
+if (this->_req_line_end == std::string::npos) {
+  size_t req_search_start = (this->_req_line_scanned_pos >= 1) ? this->_req_line_scanned_pos - 1 : 0;
+  this->_req_line_end = this->_request_raw.find("\r\n", req_search_start);
+  if (this->_req_line_end == std::string::npos) [[unlikely]] {
+    this->_req_line_scanned_pos = this->_request_raw.size();
+    if (this->_request_raw.size() > REQ_LINE_MAX_LEN) [[unlikely]] exit_fn(HeadersParseState_MalformedRequest);
+    exit_fn(HeadersParseState_NotFinished);
+  }
+}
+```
+This applies the same "resume the search" trick to the request line itself. The `-1` makes sure the parser still catches a `\r\n` split across two reads, while avoiding a full-buffer rescan every time more data arrives.
+
+- Resume header-end scanning instead of rescanning the full header block.
+```cpp
+size_t search_start = (this->_headers_scanned_pos >= 3) ? this->_headers_scanned_pos - 3 : 0;
+this->_headers_parsing_search_end = this->_request_raw.find("\r\n\r\n", search_start);
+if (this->_headers_parsing_search_end == std::string::npos) [[unlikely]] {
+  this->_headers_scanned_pos = this->_request_raw.size();
+  if (this->_request_raw.size() >= HEADERS_MAX_SIZE) [[unlikely]] exit_fn(HeadersParseState_TooLargeError);
+  exit_fn(HeadersParseState_NotFinished);
+}
+```
+The `-3` is important because the header terminator is four bytes long and can be split between reads. This keeps the search correct without repeatedly scanning bytes that were already known not to contain `\r\n\r\n`.
+
+- Grow `_request_raw` geometrically instead of resizing exactly to the next read size.
+```cpp
+size_t current_size = this->_request_raw.size();
+size_t target_size = current_size + HEADERS_USUAL_SIZE;
+if (this->_request_raw.capacity() < target_size) {
+  this->_request_raw.reserve(std::max(target_size, this->_request_raw.capacity() * 2));
+}
+
+ssize_t actual_bytes_read = 0;
+this->_request_raw.resize_and_overwrite(this->_request_raw.capacity(), [&](char* buf, size_t buf_capacity) {
+  actual_bytes_read = ::read(this->_client_fd, buf + current_size, buf_capacity - current_size);
+  if (actual_bytes_read <= 0) return current_size;
+  return current_size + static_cast<size_t>(actual_bytes_read);
+});
+```
+Instead of repeatedly growing the string by exactly `HEADERS_USUAL_SIZE`, this version grows capacity more like a vector. That reduces reallocations and memory copying when a request arrives in multiple chunks or has larger headers.
+
+- Apply the same growth strategy to body parsing.
+```cpp
+size_t target_size = current_size + bytes_remaining;
+
+if (this->_request_raw.capacity() < target_size) {
+  this->_request_raw.reserve(std::max(target_size, this->_request_raw.capacity() * 2));
+}
+
+ssize_t actual_bytes_read = 0;
+this->_request_raw.resize_and_overwrite(this->_request_raw.capacity(), [&](char* buf, size_t buf_capacity) {
+  size_t max_read = std::min(buf_capacity - current_size, bytes_remaining);
+  actual_bytes_read = ::read(this->_client_fd, buf + current_size, max_read);
+  if (actual_bytes_read <= 0) return current_size;
+  return current_size + static_cast<size_t>(actual_bytes_read);
+});
+```
+Large request bodies now benefit from the same allocation behavior. We still read directly into the final string storage, but we avoid repeatedly asking the allocator for slightly larger buffers.
+
+- Reset the new parser scan state between requests.
+```cpp
+this->_req_line_end = std::string::npos;
+this->_req_line_scanned_pos = 0;
+this->_headers_scanned_pos = 0;
+```
+Since connections can stay alive and process multiple requests, all parser-progress state has to be reset after a request is consumed. Otherwise the next request on the same connection could inherit stale scan offsets from the previous one.
+
+### `Server.cpp`
+
+- Register read and write filters once when accepting a client.
+```cpp
+struct kevent changes[2];
+EV_SET(&changes[0], client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+EV_SET(&changes[1], client_fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
+int kevent_result = kevent(this->_kq_ident, changes, 2, NULL, 0, NULL);
+```
+The previous implementation added the read filter first, then deleted and re-added filters when switching between read and write mode. This version registers both filters once: read starts enabled, write starts disabled. Later, the server only enables or disables existing filters.
+
+- Disable/enable filters instead of deleting/adding them.
+```cpp
+struct kevent changes[2];
+EV_SET(&changes[0], current_fd, EVFILT_READ, EV_DISABLE, 0, 0, NULL);
+EV_SET(&changes[1], current_fd, EVFILT_WRITE, EV_ENABLE, 0, 0, NULL);
+kevent(this->_kq_ident, changes, 2, NULL, 0, NULL);
+```
+When the response can't be fully written, the server now disables read notifications and enables write notifications without tearing down the registrations. This reduces kernel bookkeeping and makes read/write switching cheaper.
+
+- Swap back to read mode the same way after the write completes.
+```cpp
+struct kevent changes[2];
+EV_SET(&changes[0], current_fd, EVFILT_WRITE, EV_DISABLE, 0, 0, NULL);
+EV_SET(&changes[1], current_fd, EVFILT_READ, EV_ENABLE, 0, 0, NULL);
+kevent(this->_kq_ident, changes, 2, NULL, 0, NULL);
+```
+This keeps the event-loop state stable over the lifetime of the connection. A keep-alive socket can move between reading and writing many times without repeatedly deleting and recreating kernel event filters.
+
+### Results
+
+I didn't add new benchmark output for this commit here, because the main new artifact for this step is the profiling screenshot above. The expected win is not from changing the server model again, but from making the existing non-blocking model cheaper per event: fewer rescans, fewer reallocations, and fewer `kevent` registration changes.
