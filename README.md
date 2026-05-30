@@ -23,7 +23,15 @@ Initial optimizations are significant enough that we don't need to measure it us
 
 Final version of the code can be found at master, all of the other versions are refered to by their appropriate git tag.
 
-## Naive version
+## Table of Contents
+
+- [1. Naive Baseline](#1-naive-baseline)
+- [2. Parsing and Syscall Optimizations](#2-parsing-and-syscall-optimizations)
+- [3. Data Layout and I/O Micro-Optimizations](#3-data-layout-and-io-micro-optimizations)
+- [4. Blocking Multithreaded Server](#4-blocking-multithreaded-server)
+- [5. Event-Driven Non-Blocking Architecture](#5-event-driven-non-blocking-architecture)
+
+## 1. Naive Baseline
 I tried to write a version with as many beginner mistakes as possible. It can be found at commit `072df00e03af5c9978e642f355cda08153a987a0`.
 
 TLDR; 
@@ -86,7 +94,7 @@ Transfer/sec:     18.60KB
  --- Complete ---
 ```
 
-## Optimize parsing
+## 2. Parsing and Syscall Optimizations
 
 The main goal of these optimizations was to reduce syscalls as much as possible + add some allocation optimizations here and there. It can be found at commit `fb042f04c656a0c0ddf77b9a04b2aa1df24593ef`.
 
@@ -268,7 +276,7 @@ Transfer/sec:     29.19KB
  --- Complete ---
 ```
 
-## Other flow micro-optimizations
+## 3. Data Layout and I/O Micro-Optimizations
 
 The next set of optimizations focused on memory layout, data structures, and further syscall reduction. It can be found at commit `0df647a50f601d8bb49bea62152b827ac0a756bd`.
 
@@ -444,7 +452,7 @@ Transfer/sec:     29.71KB
 ```
 
 
-## Multithreading
+## 4. Blocking Multithreaded Server
 The next optimization was to stop running the whole server on a single thread and let the kernel distribute incoming connections between multiple listener sockets. It can be found at commit `4f8e4dc2c5264e49f7e2b1cbbdd63b862db8c2ce`.
 
 ### `CMakeLists.txt`
@@ -558,6 +566,296 @@ Running 15s test @ http://localhost:8888/
   4022 requests in 15.10s, 416.34KB read
 Requests/sec:    266.33
 Transfer/sec:     27.57KB
+
+ --- Complete ---
+```
+
+## 5. Event-Driven Non-Blocking Architecture
+
+The next optimization was to stop dedicating execution flow to one blocking connection at a time. Instead of waiting inside `accept()`, `read()`, or `writev()`, the server now lets the kernel tell it which file descriptors are ready and only does useful work when there is actual socket progress to make. It can be found at commit `42287ada2cbc789e143710649e50ad0c933f550e`.
+
+### `utils/sys.hpp`
+
+- Add basic platform detection.
+```cpp
+#pragma once
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    #define __IS_BSD__
+#elif defined(__linux__)
+    #define __IS_LINUX__
+#elif defined(_WIN32) || defined(_WIN64)
+    #define __IS_WINDOWS__
+    #error "Unsupported operating system (Windows). This server requires macOS, BSD, or Linux."
+#else
+    #error "Unknown and unsupported operating system."
+#endif
+```
+This is mostly groundwork for separating platform-specific networking code. The current implementation uses `kqueue`, which is available on macOS and BSD systems, but the project can now branch cleanly for Linux-specific code later.
+
+### `enums.hpp`
+
+- Replace one big parse result with smaller state-machine enums.
+```cpp
+enum HeadersParseState : uint8_t {
+  HeadersParseState_NotFinished = 0,
+  HeadersParseState_Finished = 1,
+
+  HeadersParseState_SocketError = 10,
+  HeadersParseState_ClientClosed = 11,
+  HeadersParseState_TooLargeError = 12,
+  HeadersParseState_MalformedRequest = 13,
+  HeadersParseState_HttpVersionNotSupported = 14,
+};
+
+enum BodyParseState : uint8_t {
+  BodyParseState_NotFinished = 0,
+  BodyParseState_Finished = 1,
+
+  BodyParseState_SocketError = 10,
+  BodyParseState_ClientClosed = 11,
+  BodyParseState_PayloadTooLarge = 12,
+  BodyParseState_MalformedRequest = 13,
+};
+
+enum ResponseWriteState : uint8_t {
+  ResponseWriteState_Idle = 0,
+  ResponseWriteState_NotFinished = 1,
+  ResponseWriteState_Finished = 2,
+
+  ResponseWriteState_SocketError = 10,
+  ResponseWriteState_ClientClosed = 11,
+};
+```
+The blocking version could return one final `RequestParseError`, because `parse()` owned the whole lifetime of reading a request. That doesn't work with non-blocking sockets, since a perfectly valid request might not be available yet. Splitting this into headers, body, and response states allows the server to pause and resume the request exactly where it left off.
+
+### `request.hpp & request.cpp`
+
+- Split request parsing into resumable phases.
+```cpp
+HeadersParseState Request::parse_headers();
+BodyParseState Request::parse_body();
+ResponseWriteState Request::resume_response();
+void Request::reset_state();
+```
+Instead of one blocking `parse()` function, the `Request` object is now a small state machine. Headers can be partially read, the body can be partially read, and the response can be partially written without losing progress or blocking the event loop.
+
+- Handle non-blocking `read()` correctly.
+```cpp
+if (actual_bytes_read < 0) [[unlikely]] {
+  if (errno == EAGAIN || errno == EWOULDBLOCK) exit_fn(HeadersParseState_NotFinished);
+  exit_fn(HeadersParseState_SocketError);
+}
+if (actual_bytes_read == 0) [[unlikely]] exit_fn(HeadersParseState_ClientClosed);
+```
+With non-blocking sockets, `EAGAIN` is not a real error. It just means the kernel doesn't have more bytes available right now. Returning `HeadersParseState_NotFinished` lets the server keep the connection alive and wait for the next `EVFILT_READ` notification instead of spinning or closing the socket too early.
+
+- Keep the zero-copy body path, but make it resumable.
+```cpp
+this->_request_raw.resize_and_overwrite(current_size + bytes_remaining, [&](char* buf, size_t) {
+  actual_bytes_read = ::read(this->_client_fd, buf + current_size, bytes_remaining);
+  if (actual_bytes_read <= 0) return current_size;
+  return current_size + static_cast<size_t>(actual_bytes_read);
+});
+
+if (actual_bytes_read < 0) [[unlikely]] {
+  if (errno == EAGAIN || errno == EWOULDBLOCK) exit_fn(BodyParseState_NotFinished);
+  exit_fn(BodyParseState_SocketError);
+}
+if (actual_bytes_read == 0) [[unlikely]] exit_fn(BodyParseState_ClientClosed);
+```
+The body is still read directly into `_request_raw`, but the function no longer assumes that all remaining bytes will arrive immediately. This matters a lot under load, because slow clients and large request bodies can now share the process without holding the whole server hostage.
+
+- Persist the response `iovec` state across writes.
+```cpp
+this->_response_iovecs[0].iov_base = this->_response_header_buf;
+this->_response_iovecs[0].iov_len = static_cast<size_t>(header_len);
+
+if (!resp_body.empty()) {
+  this->_response_iovecs[1].iov_base = const_cast<char*>(resp_body.data());
+  this->_response_iovecs[1].iov_len = resp_body.size();
+  this->_response_iovec_count = 2;
+} else this->_response_iovec_count = 1;
+
+this->resume_response();
+```
+The previous `writev()` implementation was already avoiding a huge response-copy, but it still expected to finish writing in the current flow. Now the `iovec` array lives inside the request object, so if the socket buffer fills up, the server can resume writing from the exact byte where it stopped.
+
+- Advance partially-written `iovec`s instead of rebuilding them.
+```cpp
+if (bytes_written >= this->_response_iovecs[0].iov_len) {
+  bytes_written -= this->_response_iovecs[0].iov_len;
+
+  if (this->_response_iovec_count == 2) {
+    if (bytes_written >= this->_response_iovecs[1].iov_len) this->_response_iovec_count = 0;
+    else {
+      this->_response_iovecs[1].iov_base = static_cast<char*>(this->_response_iovecs[1].iov_base) + bytes_written;
+      this->_response_iovecs[1].iov_len -= bytes_written;
+      this->_response_iovecs[0] = this->_response_iovecs[1];
+      this->_response_iovec_count = 1;
+    }
+  } else this->_response_iovec_count = 0;
+} else {
+  this->_response_iovecs[0].iov_base = static_cast<char*>(this->_response_iovecs[0].iov_base) + bytes_written;
+  this->_response_iovecs[0].iov_len -= bytes_written;
+}
+```
+This keeps the response path allocation-free and copy-free even when the kernel only accepts part of the response. The pointer and length are simply moved forward and the next writable event continues from there.
+
+- Add keep-alive support.
+```cpp
+auto conn_header = this->get_header_value("Connection");
+if ((
+    conn_header.has_value() && (conn_header.value() == "close" || conn_header.value() == "Close")
+  ) || (
+    this->protocol == "HTTP/1.0" && (!conn_header.has_value() || conn_header.value() != "Keep-Alive")
+  )
+) {
+  this->keep_alive = false;
+}
+```
+Instead of closing every connection after a response, the server can now keep HTTP/1.1 connections open by default. This removes a huge amount of repeated TCP setup/teardown under load, which is where a lot of the benchmark improvement comes from.
+
+- Reset only the consumed request state.
+```cpp
+if (consumed_bytes > 0 && consumed_bytes < this->_request_raw.size()) this->_request_raw.erase(0, consumed_bytes);
+else this->_request_raw.clear();
+```
+`reset_state()` keeps any already-read pipelined bytes in `_request_raw` instead of throwing them away. This makes it possible to handle multiple HTTP requests that arrive in one TCP read, without waiting for another kernel event.
+
+### `Server.cpp`
+
+- Make the listening socket non-blocking.
+```cpp
+int flags = ::fcntl(this->_socket_fd, F_GETFL, 0);
+if (flags == -1) flags = 0;
+set_opt_result = ::fcntl(this->_socket_fd, F_SETFL, flags | O_NONBLOCK);
+if (set_opt_result == -1) throw std::system_error(errno, std::generic_category(), "setting flags | O_NONBLOCK failed");
+```
+The listener itself can no longer block the process. This matters because the server is now event-driven: if `accept()` has no more queued connections, it should return immediately and let the loop process other ready sockets.
+
+- Replace the blocking accept loop with `kqueue`.
+```cpp
+this->_kq_ident = kqueue();
+if (this->_kq_ident < 0) throw std::system_error(-1, std::generic_category(), "creating kqueue failed");
+
+struct kevent change_event;
+EV_SET(&change_event, this->_socket_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+int kevent_result = kevent(this->_kq_ident, &change_event, 1, NULL, 0, NULL);
+if (kevent_result < 0) throw std::system_error(-1, std::generic_category(), "kevent register failed");
+```
+`kqueue` lets the server sleep until something interesting happens: a new client connection, readable request bytes, or a socket ready to continue writing. This removes the need to dedicate one thread of control to every blocked socket operation.
+
+- Accept all pending connections in one readiness event.
+```cpp
+while (true) {
+  int client_fd = ::accept(this->_socket_fd, nullptr, nullptr);
+  if (client_fd == -1) break;
+
+  int set_opt_result = ::fcntl(client_fd, F_SETFL, O_NONBLOCK);
+  if (set_opt_result == -1) { ::close(client_fd); continue; }
+
+  struct kevent change_event;
+  EV_SET(&change_event, client_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+  int kevent_result = kevent(this->_kq_ident, &change_event, 1, NULL, 0, NULL);
+  if (kevent_result < 0) { ::close(client_fd); continue; }
+
+  auto& req = this->_requests[static_cast<size_t>(client_fd)];
+  if (req) {
+    req->_client_fd = client_fd;
+    req->reset_state();
+  } else {
+    req = std::make_unique<Request>(client_fd);
+  }
+}
+```
+When the listening socket becomes readable, there may be more than one connection waiting in the kernel backlog. Accepting in a loop drains the backlog immediately, registers every client socket with `kqueue`, and then returns to the event loop.
+
+- Store requests by file descriptor.
+```cpp
+inline static const size_t ULIMIT = []() -> size_t {
+  const size_t default_fallback = 65536;
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+    if (limit.rlim_cur == RLIM_INFINITY) return default_fallback;
+    return limit.rlim_cur;
+  }
+  return default_fallback;
+}();
+
+std::vector<std::unique_ptr<Request>> _requests;
+```
+Since file descriptors are small integers, the server can use the fd directly as an index into `_requests`. This avoids a hash map lookup on every event and gives the hot path a very simple way to find connection state.
+
+- Use a callback for request handling.
+```cpp
+Server server(8888, [](Request* req) {
+  req->send_response(ResponseCode_OK, "text/html", "<h1> Hello world! </h1>");
+});
+server.accept_and_handle();
+```
+The server now owns the event loop, while the application only provides the logic for a completed request. This makes the non-blocking internals invisible from `main.cpp` and keeps the public API pretty small.
+
+- Switch between read and write interests.
+```cpp
+struct kevent changes[2];
+EV_SET(&changes[0], current_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+EV_SET(&changes[1], current_fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+kevent(this->_kq_ident, changes, 2, NULL, 0, NULL);
+```
+When a response can't be written fully, the server stops watching the socket for reads and starts watching it for writes. Once the write finishes, it swaps back to read events. This avoids repeatedly trying to write to a full socket buffer.
+
+- Add a small pipeline loop.
+```cpp
+if (!current_request->_request_raw.empty()) process_pipeline = true;
+```
+If `reset_state()` leaves unread bytes in the buffer, that means the client has already sent another request on the same connection. Instead of waiting for another `EVFILT_READ`, the server immediately loops and processes the next request from memory.
+
+### Results:
+```sh
+--- Warm-up ---
+Running 5s test @ http://localhost:8888/
+  8 threads and 1000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    17.70ms    1.77ms  22.46ms   91.99%
+    Req/Sec     6.77k   735.95     7.44k    89.25%
+  269633 requests in 5.02s, 28.54MB read
+Requests/sec:  53675.62
+Transfer/sec:      5.68MB
+Waiting 2 seconds for sockets to clear...
+
+--- Baseline ---
+Running 10s test @ http://localhost:8888/
+  8 threads and 10000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    70.14ms   62.24ms   1.73s    97.25%
+    Req/Sec     5.06k     1.76k    7.92k    76.40%
+  395039 requests in 10.04s, 41.82MB read
+  Socket errors: connect 0, read 6742, write 0, timeout 0
+Requests/sec:  39335.07
+Transfer/sec:      4.16MB
+Waiting 2 seconds for sockets to clear...
+
+--- Buffer Allocation & Header Parsing Stress ---
+Running 10s test @ http://localhost:8888/
+  4 threads and 5000 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    96.29ms   51.82ms 762.30ms   86.88%
+    Req/Sec     5.44k     1.28k    9.85k    77.50%
+  216496 requests in 10.09s, 22.92MB read
+Requests/sec:  21455.06
+Transfer/sec:      2.27MB
+Waiting 2 seconds for sockets to clear...
+
+--- Heavy Payloads & Fuzzing ---
+Running 15s test @ http://localhost:8888/
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   313.07ms  375.55ms   5.19s    91.39%
+    Req/Sec   100.04     26.90   180.00     65.70%
+  5956 requests in 15.09s, 645.62KB read
+Requests/sec:    394.66
+Transfer/sec:     42.78KB
 
  --- Complete ---
 ```
