@@ -26,9 +26,11 @@ Server::Server(uint16_t port, bool log_ip) : _socket_fd(-1), _port(port), _log_i
   if (set_opt_result == -1) throw std::system_error(errno, std::generic_category(), "setting TCP_NODELAY failed");
 
   sockaddr_in server_addr = {
+    .sin_len = sizeof(sockaddr_in),
     .sin_family = AF_INET,
     .sin_port = htons(this->_port),
-    .sin_addr = { .s_addr = INADDR_ANY }
+    .sin_addr = { .s_addr = INADDR_ANY },
+    .sin_zero = {0}
   };
   int bind_result = bind(this->_socket_fd, (sockaddr*)&server_addr, sizeof(server_addr));
   if (bind_result == -1) throw std::system_error(errno, std::generic_category(), "binding the server socket failed");

@@ -8,16 +8,27 @@ I'll present each version chronologically, starting from the intentionally naive
 
 For compilation and (quick) testing of each version I used:
 ```sh
-# Terminal 1
+# Terminal 1 (Server)
+ulimit -n 65536
 rm -rf build/
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/server
 
-# Terminal 2
-wrk -t2 -c400 -d10s http://localhost:8888/ # Mimics normal server requests
-wrk -t2 -c400 -d10s -s scripts/wrk-get.lua http://localhost:8888/ # sends 64KB header
-wrk -t2 -c400 -d10s -s scripts/wrk-post.lua http://localhost:8888/ # sends 64KB header and 10MB body
+# Terminal 2 (Stress Testing)
+ulimit -n 65536
+
+# Purpose: Tests the kqueue event loop's ability to accept connections and multiplex tiny payloads 
+# without hitting TCP listen backlog drops or 100% CPU deadlocks.
+wrk -t8 -c10000 -d10s --timeout 5s http://localhost:8888/ 
+
+# Purpose: The lua script generates an 'X-Large-Header' up to ~60KB. This forces Request object to continuously trigger its resize_and_overwrite() logic and 
+# pushes right up against your HEADERS_MAX_SIZE (65536 bytes) limit to test for OOMs or bounds errors.
+wrk -t4 -c5000 -d10s --timeout 5s -s scripts/wrk-get.lua http://localhost:8888/ 
+
+# Purpose: Generates huge request bodies (1MB to ~9.4MB), staying just under BODY_MAX_SIZE (10MB). It also has a 20% chance to inject a 40KB chaos header. 
+# Tests the scatter/gather I/O handling of large memory blocks and the state machine's ability to transition cleanly from giant headers to giant bodies.
+wrk -t4 -c100 -d15s --timeout 15s -s scripts/wrk-post.lua http://localhost:8888/
 ```
 
 Initial optimizations are significant enough that we don't need to measure it using professional tooling.
