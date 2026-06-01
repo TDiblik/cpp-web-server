@@ -4,6 +4,10 @@ This is an example of how to go from a totally unoptimized c++23 web server to a
 
 I mainly developed this as a learning project on how to optimize c++ code interating with sockets.
 
+**You can watch the full architectural breakdown on YouTube:**
+* [Part 1: Optimizing a blocking server to 9,000 req/sec](https://youtu.be/dCwylDrxowQ)
+* [Part 2: Rewriting a C++ Web Server From 9,000 to 58,000 Req/Sec](https://youtu.be/66FlfZYIitk)
+
 I'll present each version chronologically, starting from the intentionally naive implementation and ending with the most optimized version. For each step, I'll explain what changed, why it matters, and how it affected performance.
 
 For compilation and (quick) testing of each version I used:
@@ -574,6 +578,8 @@ Transfer/sec:     27.57KB
 ```
 
 ## 5. Event-Driven Non-Blocking Architecture
+
+*(See the video breakdown of this kqueue implementation here: [https://youtu.be/66FlfZYIitk])*
 
 The next optimization was to stop dedicating execution flow to one blocking connection at a time. Instead of waiting inside `accept()`, `read()`, or `writev()`, the server now lets the kernel tell it which file descriptors are ready and only does useful work when there is actual socket progress to make. It can be found at commit `42287ada2cbc789e143710649e50ad0c933f550e`.
 
